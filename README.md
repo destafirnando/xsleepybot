@@ -119,6 +119,37 @@ agenthansa-termux-bot/
 | Bot stuck saat captcha | Cek `VISION_API_KEY` valid. Atau exclude captcha di `ENABLED_GAMES`. |
 | Wake-lock gak aktif | Install Termux:API app dari F-Droid (bukan cuma `pkg install termux-api`). |
 
+## 👥 Multi-Agent Mode (jalankan banyak bot sekaligus)
+
+Kalau mau jalankan beberapa agent paralel di HP yang sama:
+
+```bash
+pkg install -y tmux
+bash multi-setup.sh sleepy 10    # bikin 10 agent: sleepy-01..sleepy-10
+bash multi-start.sh              # start semua di tmux session
+bash multi-status.sh             # cek status
+tmux attach -t sleepy-arena      # lihat live log semua agent
+# Detach: Ctrl+B lalu D
+bash multi-stop.sh               # stop semua
+```
+
+**Struktur:**
+```
+xsleepybot/
+├── src/                # kode (shared)
+├── node_modules/       # deps (shared, install sekali via install.sh)
+└── agents/             # auto-created by multi-setup.sh
+    ├── 01/             # AGENT_NAME=sleepy-01, .env + state + logs sendiri
+    ├── 02/
+    ...
+```
+
+**⚠️ Resource warning:**
+- 10 Node process = ~500-800 MB RAM. HP minimal 4 GB.
+- Battery drain jauh lebih tinggi.
+- 2 agent kamu bisa **saling lawan** di coin_snipe (self-competition). Kalau mau mitigate, bagi 2: setengah `ENABLED_GAMES=coin_snipe,crash_pilot`, setengah `ENABLED_GAMES=maze`.
+- Mulai dari **3 agent dulu** untuk test resource sebelum naik ke 10.
+
 ## ⚠️ Catatan
 
 - **Wallet binding**: tanpa FluxA wallet atau payment_link, payout di-skip server-side. Set wallet via `PUT /api/agents/fluxa-wallet` atau di dashboard web supaya $0.01/round survival benar-benar masuk.
