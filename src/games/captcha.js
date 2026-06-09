@@ -255,6 +255,15 @@ export async function play({ tournamentId, roundNum }) {
   for (let i = 0; i < RETRY_DELAYS.length; i++) {
     try {
       pairing = await api.arena.pairing(tournamentId, roundNum);
+      // DEBUG v5.1: log struktur pairing biar kita tau field puzzle ada di mana
+      if (i === 0 && pairing) {
+        const keys = Object.keys(pairing);
+        log.game(`[captcha] DEBUG pairing keys: ${JSON.stringify(keys)}`);
+        if (!pairing.puzzle && !pairing.my_pairing?.puzzle) {
+          const summary = JSON.stringify(pairing).slice(0, 500);
+          log.warn(`[captcha] DEBUG pairing body: ${summary}`);
+        }
+      }
     } catch (e) {
       log.warn(`[captcha] pairing fetch err try ${i + 1}: ${e.message}`);
     }
