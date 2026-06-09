@@ -69,17 +69,18 @@ case ",$GAMES," in
   *,maze,*)
     MAZE_MODE_ARG="${2:-}"
     if [ -z "$MAZE_MODE_ARG" ]; then
-      echo
       echo "================================================================="
       echo "  MAZE MODE - pilih strategi maze (game ikut bermain)"
       echo "================================================================="
-      echo "  [s] SAFE - target dist 10 (score 100+), survival ~95%  [DEFAULT]"
-      echo "  [p] PUSH - target dist 14 (score 140+), survival ~70%"
+      echo "  [d] DEFENSIVE - target dist 7, score 70+, survival ~99% (anti-eliminasi)"
+      echo "  [s] SAFE - target dist 10, score 100+, survival ~95%  [DEFAULT]"
+      echo "  [p] PUSH - target dist 14, score 140+, survival ~70%"
       echo "================================================================="
-      printf "  Pilihan (s/p, Enter=safe): "
+      printf "  Pilihan (d/s/p, Enter=safe): "
       read -r MAZE_MODE_ARG
     fi
     case "$MAZE_MODE_ARG" in
+      d|D|defensive|DEFENSIVE) MAZE_MODE="defensive" ;;
       p|P|push|PUSH) MAZE_MODE="push" ;;
       *) MAZE_MODE="safe" ;;
     esac
