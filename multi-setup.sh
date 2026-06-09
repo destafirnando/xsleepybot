@@ -53,8 +53,9 @@ VISION_API_KEY=
 VISION_FALLBACK=
 VISION_FALLBACK_KEY=
 
-# Maze mode: safe (score 100+, survival 95%) atau push (score 140+, survival 70%)
-MAZE_MODE=defensive
+# Maze mode: survive (default) | push | aggressive | safe
+# Default 'survive' = target dist 11 (score 110+) untuk lewat median R1
+MAZE_MODE=survive
 
 # Polling intervals (detik)
 IDLE_POLL_INTERVAL=120

@@ -1,66 +1,69 @@
-// Maze Runner v5 - "Conservative Survival" strategy.
+// Maze Runner v6 - "Push to Survive" strategy.
 //
-// LESSON LEARNED dari production log:
-// - Bot v4 boros HP banget: final HP 4-25 (mestinya 50+)
-// - Wall bump terjadi (cost=20 di log) = neighborhood detection bug
-// - Random exit fase BUANG HP tanpa GAIN distance
-// - Eliminated R1 = score R1 di bawah median (terlalu agresif/mati)
+// LESSONS LEARNED dari tournament data analysis (TID 615f7d13):
+// - Top 23 survivors R1: score 95-169
+// - Median R1 cutoff: ~95 score (dist 9 + tile 5)
+// - Top 8 score 127+: dist 12-14
+// - Bot defensive (target 7, score 70) = DI BAWAH median = eliminated R1
 //
-// FIX v5 - 4 prinsip:
+// FIX v6 - prioritas SURVIVAL via DIST yang cukup:
+// - Target dist 11 (score 110+) untuk LEWAT median R1
+// - Mode push: target 13 untuk top 30%
+// - Mode aggressive: target 15 untuk top 10%
 //
-// 1. HP CONSERVATION FIRST
-//    - Step 1-by-1 saat HP < 75 (bukan chain 3)
-//    - Stop push lebih awal (hpFloor naik)
-//
-// 2. NEVER WALL BUMP
-//    - Validasi neighborhood STRICT sebelum tiap step
-//    - Kalau primary direction = wall/oob/null -> pivot, jangan bump
-//
-// 3. NO RANDOM EXIT
-//    - Random exit di v4 buang 15-25 HP untuk gain dist 0-2
-//    - SKIP fase ini sepenuhnya
-//    - Phase 2 cukup: scan + dodge 1-2 step (kalau perlu)
-//
-// 4. HIGH-COST DETECTION
-//    - Setelah tiap step, monitor HP cost
-//    - 2 step berturut cost > 10 = high-cost zone, STOP push
-//    - 1 step cost > 25 = tile mengerikan, retreat 1 step lalu pivot
-//
-// MODE DEFAULT = 'defensive' (was 'safe')
-//   - Target dist 7, hpFloor 75, survival 99%
-//   - Score 70-90 (cukup untuk LEWAT median cutoff)
+// PRINSIP YANG TETAP DARI v5:
+// 1. Strict wall avoidance (no bump)
+// 2. High-cost zone detection (stop di 2 cost > 12 berturut)
+// 3. NO random exit (buang HP)
+// 4. Phase 2 dodge max 2 step
 
 import { log } from '../logger.js';
 import { api } from '../api.js';
 
 // ====================================================================
-// Konstanta
-// ====================================================================
 const MAX_TILE = 50;
 const SCAN_COST = 5;
-const WALL_BUMP_COST = 20;
 
+// MODE configuration - TARGET DIST DINAIKAN agar lewat median (95)
 const CONFIG = {
-  defensive: {
-    targetDist: 7,
-    hpFloor: 75,        // stop push kalau HP <= ini
-    pushExtension: 0,   // jangan extend - too risky
-    maxDodge: 3,
-    label: 'DEFENSIVE',
+  // 'survive' = NEW DEFAULT - target lewat median R1
+  survive: {
+    targetDist: 11,
+    hpFloor: 40,    // turun dari 75 → 40 supaya bisa push lebih jauh
+    pushExtension: 1, // extend ke 12 kalau HP banyak
+    maxDodge: 2,
+    label: 'SURVIVE',
   },
-  safe: {
-    targetDist: 9,
-    hpFloor: 65,
+  // 'push' = top 30%
+  push: {
+    targetDist: 13,
+    hpFloor: 30,
+    pushExtension: 1,
+    maxDodge: 2,
+    label: 'PUSH',
+  },
+  // 'aggressive' = top 10%
+  aggressive: {
+    targetDist: 15,
+    hpFloor: 20,
+    pushExtension: 0,
+    maxDodge: 1,
+    label: 'AGGRESSIVE',
+  },
+  // Backward compat
+  defensive: {  // alias untuk survive
+    targetDist: 11,
+    hpFloor: 40,
+    pushExtension: 1,
+    maxDodge: 2,
+    label: 'SURVIVE',
+  },
+  safe: {  // alias untuk push moderate
+    targetDist: 12,
+    hpFloor: 35,
     pushExtension: 1,
     maxDodge: 2,
     label: 'SAFE',
-  },
-  push: {
-    targetDist: 12,
-    hpFloor: 45,
-    pushExtension: 2,
-    maxDodge: 2,
-    label: 'PUSH',
   },
 };
 
@@ -78,9 +81,6 @@ const CORNERS = {
 };
 const CORNER_KEYS = Object.keys(CORNERS);
 
-// ====================================================================
-// Per-agent slot
-// ====================================================================
 function getAgentSlot() {
   const cwd = process.cwd();
   const match = cwd.match(/agents[\/\\](\d+)$/);
@@ -96,13 +96,9 @@ function pickCorner() {
   return CORNER_KEYS[slot % CORNER_KEYS.length];
 }
 
-// ====================================================================
-// Neighborhood STRICT - return: 'open' | 'wall' | 'unknown'
-// (was: true/false/null - confusing)
-// ====================================================================
+// Neighborhood STRICT
 function neighStatus(nb, dir) {
   if (!nb) return 'unknown';
-
   if (Array.isArray(nb)) {
     const idx = ['W', 'A', 'S', 'D'].indexOf(dir);
     if (idx < 0 || idx >= nb.length) return 'unknown';
@@ -116,14 +112,12 @@ function neighStatus(nb, dir) {
     }
     return 'unknown';
   }
-
   const aliases = {
     W: ['W', 'up', 'north', 'n', 'top'],
     S: ['S', 'down', 'south', 's', 'bottom'],
     A: ['A', 'left', 'west', 'w', 'l'],
     D: ['D', 'right', 'east', 'e', 'r'],
   };
-
   for (const k of aliases[dir]) {
     if (k in nb) {
       const v = nb[k];
@@ -139,29 +133,22 @@ function neighStatus(nb, dir) {
   return 'unknown';
 }
 
-// "openable" = kita BOLEH coba (open atau unknown)
-// Kalau strict mode, kita HANYA mau yang open.
 function isOpenable(nb, dir, strict = false) {
   const s = neighStatus(nb, dir);
   if (strict) return s === 'open';
-  return s !== 'wall'; // open atau unknown OK
+  return s !== 'wall';
 }
 
-// ====================================================================
-// Pilih next direction - STRICT mode (hindari wall)
-// Priority: corner directions > perpendicular > any open
-// ====================================================================
 function nextStep(nb, pattern, lastDir, blocked = new Set()) {
   const primary = pattern[0];
   const alt = pattern[1];
 
-  // Strict pass: hanya yang DIPASTIKAN open
+  // Strict pass
   for (const d of [primary, alt]) {
     if (blocked.has(d)) continue;
     if (isOpenable(nb, d, true)) return { dir: d, confidence: 'high' };
   }
 
-  // Perpendicular (still strict open)
   const perp = primary === 'W' || primary === 'S' ? ['A', 'D'] : ['W', 'S'];
   for (const d of perp) {
     if (blocked.has(d)) continue;
@@ -169,14 +156,13 @@ function nextStep(nb, pattern, lastDir, blocked = new Set()) {
     if (isOpenable(nb, d, true)) return { dir: d, confidence: 'medium' };
   }
 
-  // Lenient pass: terima unknown (akan di-monitor cost)
+  // Lenient (accept unknown)
   for (const d of [primary, alt, ...perp]) {
     if (blocked.has(d)) continue;
     if (d === OPP[lastDir]) continue;
     if (isOpenable(nb, d, false)) return { dir: d, confidence: 'low' };
   }
 
-  // Last resort: any direction
   for (const d of ['W', 'A', 'S', 'D']) {
     if (blocked.has(d)) continue;
     return { dir: d, confidence: 'desperate' };
@@ -184,24 +170,19 @@ function nextStep(nb, pattern, lastDir, blocked = new Set()) {
   return { dir: primary, confidence: 'fallback' };
 }
 
-// Dodge - perpendicular preferred
 function dodgeStep(nb, pattern, lastDir, attemptN = 0) {
   const primary = pattern[0];
   const perp = primary === 'W' || primary === 'S' ? ['A', 'D'] : ['W', 'S'];
-
   let candidates;
   switch (attemptN) {
     case 0: candidates = perp; break;
     case 1: candidates = [pattern[1], primary]; break;
     default: candidates = ['W', 'A', 'S', 'D'];
   }
-
-  // Strict: hanya open
   for (const d of candidates) {
     if (d === OPP[lastDir]) continue;
     if (isOpenable(nb, d, true)) return d;
   }
-  // Lenient
   for (const d of candidates) {
     if (isOpenable(nb, d, false)) return d;
   }
@@ -218,16 +199,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // MAIN PLAY
 // ====================================================================
 export async function play({ tournamentId, roundNum, roundEndsAt }) {
-  // DEFAULT mode = 'defensive' (was 'safe' di v4)
-  const mode = (process.env.MAZE_MODE || 'defensive').toLowerCase();
-  const cfg = CONFIG[mode] || CONFIG.defensive;
+  // DEFAULT mode = 'survive' (was 'defensive' di v5)
+  const mode = (process.env.MAZE_MODE || 'survive').toLowerCase();
+  const cfg = CONFIG[mode] || CONFIG.survive;
+
+  // Mutable copy biar bisa adaptive extend tanpa korup CONFIG global
+  const targetDist = cfg.targetDist;
+  let effectiveTarget = targetDist;
+  let extended = false;
+
   const slot = getAgentSlot();
   const corner = pickCorner();
   const pattern = CORNERS[corner].dirs;
 
   log.game(
-    `[maze] R${roundNum}: ${cfg.label} v5 | slot=${slot} corner=${corner} ` +
-      `pattern=${pattern.join('')} target=${cfg.targetDist} floor=${cfg.hpFloor}`,
+    `[maze] R${roundNum}: ${cfg.label} v6 | slot=${slot} corner=${corner} ` +
+      `pattern=${pattern.join('')} target=${targetDist} floor=${cfg.hpFloor}`,
   );
 
   let pairing;
@@ -243,9 +230,8 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
     return;
   }
 
-  // Cek eliminated status (dari prior round)
   if (pairing?.eliminated || pairing?.my_pairing?.eliminated) {
-    log.warn(`[maze] R${roundNum}: ELIMINATED in prior round, skip`);
+    log.warn(`[maze] R${roundNum}: ELIMINATED already, skip`);
     return;
   }
 
@@ -255,67 +241,66 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
   let neighborhood = ms.neighborhood || null;
   let lastDir = null;
   let isDead = false;
-  let consecutiveHighCost = 0; // counter for high-cost zone detection
+  let consecutiveHighCost = 0;
+  let stepCount = 0;
 
   const endTime = roundEndsAt
     ? new Date(roundEndsAt).getTime()
     : Date.now() + 9.5 * 60 * 1000;
 
-  // Reserve waktu lebih: 60s untuk phase 2 + buffer
-  const phase1Deadline = endTime - 60_000;
+  const phase1Deadline = endTime - 60_000; // reserve 60s for phase 2
 
-  // ==== PHASE 1: CONSERVATIVE PUSH (1-by-1 saat HP rendah) ====
-  let stepCount = 0;
-
+  // ==== PHASE 1: PUSH PUSH PUSH (target 11+) ====
   while (!isDead && Date.now() < phase1Deadline) {
     const dist = distFromCenter(pos[0], pos[1]);
 
-    // STOP CONDITIONS - banyak layer
+    // STOP: HP critical
     if (hp <= cfg.hpFloor) {
       log.game(`[maze] HP=${hp.toFixed(1)} <= floor ${cfg.hpFloor}, STOP at dist=${dist}`);
       break;
     }
-    // Death-zone: kena 1 spike tile = mati
+    // STOP: death-zone (1 spike tile = mati)
     if (hp <= MAX_TILE + 5) {
       log.warn(`[maze] death-zone HP=${hp.toFixed(1)}, STOP at dist=${dist}`);
       break;
     }
-    // High-cost zone detection
+    // STOP: high-cost zone (2 step berturut > 12 HP)
+    // Tolerance lebih tinggi dari v5 (was 10) supaya tidak terlalu cepat stop
     if (consecutiveHighCost >= 2) {
-      log.warn(`[maze] HIGH-COST zone (2 consec >10HP), STOP at dist=${dist} hp=${hp.toFixed(1)}`);
+      log.warn(`[maze] HIGH-COST zone (2 consec >12HP), STOP at dist=${dist} hp=${hp.toFixed(1)}`);
       break;
     }
 
-    if (dist >= cfg.targetDist) {
-      // Adaptive extend ONLY kalau HP berlimpah
-      if (cfg.pushExtension > 0 && hp >= cfg.hpFloor + 25 && stepCount < 15) {
-        log.game(`[maze] hit target ${cfg.targetDist}, HP ample (${hp.toFixed(1)}), extend +1`);
-        cfg.targetDist += cfg.pushExtension; // mutate local copy via cfg... wait cfg is reference
-        // Actually use a different var to avoid mutating shared CONFIG
-        // Quick fix: just break here for safety
-        log.game(`[maze] dist=${dist} >= target, STOP push (no extend in v5)`);
+    // Target reached?
+    if (dist >= effectiveTarget) {
+      // Adaptive extend kalau HP masih banyak
+      if (
+        !extended &&
+        cfg.pushExtension > 0 &&
+        hp >= cfg.hpFloor + 25 &&
+        stepCount < 18
+      ) {
+        effectiveTarget += cfg.pushExtension;
+        extended = true;
+        log.game(`[maze] hit target, HP=${hp.toFixed(1)} ample, extend to ${effectiveTarget}`);
+      } else {
+        log.game(`[maze] dist=${dist} >= target ${effectiveTarget}, STOP`);
         break;
       }
-      log.game(`[maze] dist=${dist} >= target, STOP push`);
-      break;
     }
 
-    // CHAIN LENGTH: lebih konservatif dari v4
-    let chainLen;
-    if (hp >= cfg.hpFloor + 30) chainLen = 2; // chain 2 saat HP buffer besar
-    else chainLen = 1; // chain 1 saat HP rendah - bisa monitor cost per step
+    // Chain length:
+    //  - HP buffer >= floor+30: chain 2
+    //  - else: chain 1 (hati-hati)
+    let chainLen = hp >= cfg.hpFloor + 30 ? 2 : 1;
 
-    // Pilih direction (strict no-wall)
     const { dir, confidence } = nextStep(neighborhood, pattern, lastDir);
 
-    // CRITICAL CHECK: kalau confidence rendah, ekstra safety
     if (confidence === 'desperate' || confidence === 'fallback') {
-      log.warn(`[maze] no safe direction (${confidence}), STOP at dist=${dist} hp=${hp.toFixed(1)}`);
+      log.warn(`[maze] no safe direction (${confidence}), STOP at dist=${dist}`);
       break;
     }
 
-    // Build chain - kalau chainLen=1, single dir
-    // Kalau chainLen=2, hanya tambah kalau confidence high
     const chain = [dir];
     if (chainLen >= 2 && confidence === 'high') {
       const altDir = pattern[1];
@@ -324,21 +309,18 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
       }
     }
 
-    // Submit move
     let res;
     const hpBefore = hp;
     try {
       res = await api.arena.submitMaze(tournamentId, roundNum, chain.join(''));
     } catch (e) {
-      // 403 eliminated -> stop
       if (e.status === 403 || /eliminated/i.test(e.message)) {
         log.warn(`[maze] eliminated (403), stop`);
         break;
       }
       if (e.status === 429) {
         const wait = e.data?.cooldown_remaining_seconds
-          ? e.data.cooldown_remaining_seconds * 1000
-          : 1100;
+          ? e.data.cooldown_remaining_seconds * 1000 : 1100;
         await sleep(wait + 50);
         continue;
       }
@@ -361,7 +343,7 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
     const cost = hpBefore - hp;
     stepCount++;
 
-    if (cost >= 11) consecutiveHighCost++;
+    if (cost >= 13) consecutiveHighCost++;
     else consecutiveHighCost = 0;
 
     log.game(
@@ -371,20 +353,17 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
     );
 
     if (isDead) {
-      log.err(`[maze] DIED, score=0`);
+      log.err(`[maze] DIED at step ${stepCount}, score=0`);
       return;
     }
 
-    // Kalau bumped wall, log warning + extra cost penalty
     if (bumped) {
-      log.warn(`[maze] WALL BUMP detected - neighborhood data was wrong/stale`);
-      // Force chain length = 1 next iteration
-      consecutiveHighCost = 2; // trigger stop
+      log.warn(`[maze] WALL_BUMP - neighborhood data was stale`);
+      consecutiveHighCost = 2;
     }
 
     lastDir = chain[chain.length - 1];
 
-    // Cooldown
     if (res.cooldown_until) {
       const wait = new Date(res.cooldown_until).getTime() - Date.now();
       if (wait > 0) await sleep(wait + 50);
@@ -398,18 +377,12 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
     `[maze] PUSH DONE: pos=(${pos.join(',')}) hp=${hp.toFixed(1)} dist=${finalDist} steps=${stepCount}`,
   );
 
-  // ==== PHASE 2: ANTI-COLLAPSE (BUKAN random exit!) ====
-  // Phase 2 kita PANGKAS jadi lebih simple & efektif:
-  // - Scan tile sekali (cost 5 HP)
-  // - Kalau crowded (>=2 agent), dodge 1 step perpendicular
-  // - Kalau setelah dodge masih crowded, dodge 1 step lagi (max 2 dodge)
-  // - Selesai. JANGAN random walk.
-
+  // ==== PHASE 2: ANTI-COLLAPSE (max 2 dodge) ====
   let dodgeCount = 0;
 
   while (
     !isDead &&
-    hp >= SCAN_COST + 15 &&  // butuh HP minimum untuk scan + dodge
+    hp >= SCAN_COST + 15 &&
     Date.now() < endTime - 10_000 &&
     dodgeCount < cfg.maxDodge
   ) {
@@ -426,15 +399,12 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
         log.err(`[maze] DIED on scan`);
         return;
       }
-
       if (occupants <= 1) {
-        log.ok(`[maze] tile CLEAR (1 agent)`);
+        log.ok(`[maze] tile CLEAR`);
         break;
       }
 
       const collapseRisk = Math.min(1, (occupants - 1) * 0.25);
-
-      // HP terlalu rendah untuk dodge?
       if (hp < 25) {
         log.warn(
           `[maze] HP=${hp.toFixed(1)} too low to dodge, accept ${(collapseRisk * 100).toFixed(0)}% risk`,
@@ -442,7 +412,6 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
         break;
       }
 
-      // Dodge!
       if (check.cooldown_until) {
         const wait = new Date(check.cooldown_until).getTime() - Date.now();
         if (wait > 0) await sleep(wait + 50);
@@ -478,7 +447,6 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
         log.warn(`[maze] dodge error: ${e.message}`);
         break;
       }
-
       dodgeCount++;
     } catch (e) {
       if (e.status === 403 || /eliminated/i.test(e.message)) {
@@ -491,10 +459,9 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
   }
 
   if (dodgeCount > 0 && !isDead) {
-    log.game(`[maze] anti-collapse done: ${dodgeCount} dodge`);
+    log.game(`[maze] anti-collapse: ${dodgeCount} dodge done`);
   }
 
-  // ==== FINAL ====
   const final = distFromCenter(pos[0], pos[1]);
   const expectedScore = final * 10;
   log.ok(
