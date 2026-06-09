@@ -49,6 +49,9 @@ ENABLED_GAMES=coin_snipe,crash_pilot,maze
 VISION_PROVIDER=none
 VISION_API_KEY=
 
+# Maze mode: safe (score 100+, survival 95%) atau push (score 140+, survival 70%)
+MAZE_MODE=safe
+
 # Polling intervals (detik)
 IDLE_POLL_INTERVAL=120
 ACTIVE_POLL_INTERVAL=10

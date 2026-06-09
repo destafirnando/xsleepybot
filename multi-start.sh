@@ -90,6 +90,43 @@ done
 echo "==> ENABLED_GAMES updated"
 echo
 
+# --- Sub-menu: MAZE_MODE (kalau maze ikut bermain) ---
+case ",$GAMES," in
+  *,maze,*)
+    MAZE_MODE_ARG="${2:-}"
+    if [ -z "$MAZE_MODE_ARG" ]; then
+      echo "================================================================="
+      echo "  MAZE MODE - pilih strategi maze (game ikut bermain)"
+      echo "================================================================="
+      echo "  [s] SAFE - target dist 10 (score 100+), survival ~95%  [DEFAULT]"
+      echo "  [p] PUSH - target dist 14 (score 140+), survival ~70%"
+      echo "================================================================="
+      printf "  Pilihan (s/p, Enter=safe): "
+      read -r MAZE_MODE_ARG
+    fi
+    case "$MAZE_MODE_ARG" in
+      p|P|push|PUSH) MAZE_MODE="push" ;;
+      *) MAZE_MODE="safe" ;;
+    esac
+
+    echo "==> Set MAZE_MODE=$MAZE_MODE untuk $COUNT agent"
+    for D in $DIRS; do
+      ENV_FILE="$D.env"
+      [ -f "$ENV_FILE" ] || continue
+      if grep -q "^MAZE_MODE=" "$ENV_FILE"; then
+        TMPFILE=$(mktemp)
+        awk -v m="$MAZE_MODE" '/^MAZE_MODE=/{print "MAZE_MODE=" m; next} {print}' \
+          "$ENV_FILE" > "$TMPFILE"
+        mv "$TMPFILE" "$ENV_FILE"
+      else
+        echo "MAZE_MODE=$MAZE_MODE" >> "$ENV_FILE"
+      fi
+    done
+    echo "==> MAZE_MODE updated"
+    echo
+    ;;
+esac
+
 # --- Kill existing session if any ---
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
