@@ -57,10 +57,11 @@ function parseSelected(text) {
 // Provider implementations
 // =====================================================================
 
-// Groq - gratis, cepat. Vision model: llama-3.2-11b-vision-preview.
+// Groq - gratis, cepat. Default model: llama-4-scout (multimodal native).
+// llama-3.2-vision sudah deprecated April 2026.
 // Endpoint OpenAI-compatible.
 // Docs: https://console.groq.com/docs/vision
-async function solveGroq(apiKey, imageUrl, model = 'llama-3.2-11b-vision-preview') {
+async function solveGroq(apiKey, imageUrl, model = 'meta-llama/llama-4-scout-17b-16e-instruct') {
   // Groq accepts both URL & base64. Pakai base64 supaya tidak perlu agenthansa publik.
   const { buffer, contentType } = await api.fetchBytes(imageUrl);
   const b64 = buffer.toString('base64');
@@ -75,7 +76,7 @@ async function solveGroq(apiKey, imageUrl, model = 'llama-3.2-11b-vision-preview
     },
     body: JSON.stringify({
       model,
-      max_tokens: 50,
+      max_tokens: 80,
       temperature: 0,
       messages: [
         {
@@ -207,8 +208,10 @@ async function solveAnthropic(apiKey, imageUrl) {
 export async function solveWithVision({ provider, apiKey, imageUrl }) {
   if (!apiKey) throw new Error(`No API key for provider=${provider}`);
   switch (provider) {
-    case 'groq':       return solveGroq(apiKey, imageUrl);
-    case 'groq-90b':   return solveGroq(apiKey, imageUrl, 'llama-3.2-90b-vision-preview');
+    case 'groq':         return solveGroq(apiKey, imageUrl);
+    case 'groq-scout':   return solveGroq(apiKey, imageUrl, 'meta-llama/llama-4-scout-17b-16e-instruct');
+    case 'groq-maverick':return solveGroq(apiKey, imageUrl, 'meta-llama/llama-4-maverick-17b-128e-instruct');
+    case 'groq-90b':     return solveGroq(apiKey, imageUrl, 'meta-llama/llama-4-maverick-17b-128e-instruct'); // alias backward compat
     case 'gemini':         return solveGemini(apiKey, imageUrl);
     case 'gemini-flash':   return solveGemini(apiKey, imageUrl, 'gemini-2.5-flash');
     case 'gemini-1.5':     return solveGemini(apiKey, imageUrl, 'gemini-1.5-flash');
