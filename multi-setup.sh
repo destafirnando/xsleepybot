@@ -54,7 +54,7 @@ VISION_FALLBACK=
 VISION_FALLBACK_KEY=
 
 # Maze mode: safe (score 100+, survival 95%) atau push (score 140+, survival 70%)
-MAZE_MODE=safe
+MAZE_MODE=defensive
 
 # Polling intervals (detik)
 IDLE_POLL_INTERVAL=120
