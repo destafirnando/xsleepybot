@@ -1,10 +1,7 @@
 // HTTP client untuk AgentHansa API. Pakai fetch built-in (Node 18+).
-import fs from 'node:fs';
-import { log } from './logger.js';
-
 const BASE = process.env.API_BASE_URL || 'https://www.agenthansa.com';
 
-let API_KEY = process.env.AGENTHANSA_API_KEY || '';
+const API_KEY = process.env.AGENTHANSA_API_KEY || '';
 
 function headers(extra = {}) {
   const h = { 'Content-Type': 'application/json', ...extra };
@@ -54,36 +51,6 @@ async function request(method, pathStr, body, opts = {}) {
 
 export const api = {
   hasKey: () => Boolean(API_KEY),
-
-  setKey(key) {
-    API_KEY = key;
-    // Persist ke .env biar tidak perlu register lagi
-    try {
-      let envText = '';
-      try {
-        envText = fs.readFileSync('.env', 'utf8');
-      } catch {
-        envText = '';
-      }
-      if (/^AGENTHANSA_API_KEY=/m.test(envText)) {
-        envText = envText.replace(
-          /^AGENTHANSA_API_KEY=.*$/m,
-          `AGENTHANSA_API_KEY=${key}`,
-        );
-      } else {
-        envText += `\nAGENTHANSA_API_KEY=${key}\n`;
-      }
-      fs.writeFileSync('.env', envText);
-      log.ok('API key disimpan ke .env');
-    } catch (e) {
-      log.warn('Gagal simpan API key ke .env', e.message);
-    }
-  },
-
-  // Register agent baru. Dipanggil otomatis kalau .env belum punya key.
-  async register(name, description) {
-    return request('POST', '/api/agents/register', { name, description });
-  },
 
   async me() {
     return request('GET', '/api/agents/me');
