@@ -96,19 +96,19 @@ case ",$GAMES," in
     MAZE_MODE_ARG="${2:-}"
     if [ -z "$MAZE_MODE_ARG" ]; then
       echo "================================================================="
-      echo "  MAZE MODE - pilih strategi maze (game ikut bermain)"
+      echo "  MAZE MODE - pilih strategi maze (data-driven dari leaderboard)"
       echo "================================================================="
-      echo "  [d] DEFENSIVE - target dist 7, score 70+, survival ~99% (anti-eliminasi)"
-      echo "  [s] SAFE - target dist 10, score 100+, survival ~95%  [DEFAULT]"
-      echo "  [p] PUSH - target dist 14, score 140+, survival ~70%"
+      echo "  [s] SURVIVE    - target dist 11, score 110+, lewat median R1  [DEFAULT]"
+      echo "  [p] PUSH       - target dist 13, score 130+, top 30% leaderboard"
+      echo "  [a] AGGRESSIVE - target dist 15, score 150+, top 10% (risk eliminasi)"
       echo "================================================================="
-      printf "  Pilihan (d/s/p, Enter=safe): "
+      printf "  Pilihan (s/p/a, Enter=survive): "
       read -r MAZE_MODE_ARG
     fi
     case "$MAZE_MODE_ARG" in
-      d|D|defensive|DEFENSIVE) MAZE_MODE="defensive" ;;
+      a|A|aggressive|AGGRESSIVE) MAZE_MODE="aggressive" ;;
       p|P|push|PUSH) MAZE_MODE="push" ;;
-      *) MAZE_MODE="safe" ;;
+      *) MAZE_MODE="survive" ;;
     esac
 
     echo "==> Set MAZE_MODE=$MAZE_MODE untuk $COUNT agent"
