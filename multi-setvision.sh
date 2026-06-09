@@ -44,7 +44,9 @@ if [ -z "$PROVIDER" ]; then
   echo "  Provider yang didukung:"
   echo "    groq      - llama-3.2-11b-vision (cepat, gratis 30 RPM) [recommended]"
   echo "    groq-90b  - llama-3.2-90b-vision (lebih akurat, gratis 15 RPM)"
-  echo "    gemini    - gemini-1.5-flash (gratis 15 RPM)"
+  echo "    gemini    - gemini-2.5-flash-lite (paling cepat, gratis 15 RPM) [fallback recommended]"
+  echo "    gemini-flash - gemini-2.5-flash (lebih akurat, gratis tapi RPM lebih ketat)"
+  echo "    gemini-1.5 - gemini-1.5-flash (legacy, gratis 15 RPM)"
   echo "    openai    - gpt-4o-mini (\$0.0001/solve)"
   echo "    anthropic - claude-3-5-haiku (\$0.001/solve)"
   echo "    none      - skip captcha (random fallback)"
@@ -70,7 +72,7 @@ fi
 
 # --- Validasi ---
 case "$PROVIDER" in
-  groq|groq-90b|gemini|openai|anthropic|none) ;;
+  groq|groq-90b|gemini|gemini-flash|gemini-1.5|openai|anthropic|none) ;;
   *) echo "ERROR: provider tidak dikenal: '$PROVIDER'"; exit 1 ;;
 esac
 
@@ -81,7 +83,7 @@ fi
 
 if [ -n "$FB_PROVIDER" ] && [ "$FB_PROVIDER" != "none" ]; then
   case "$FB_PROVIDER" in
-    groq|groq-90b|gemini|openai|anthropic) ;;
+    groq|groq-90b|gemini|gemini-flash|gemini-1.5|openai|anthropic) ;;
     *) echo "ERROR: fallback provider tidak dikenal: '$FB_PROVIDER'"; exit 1 ;;
   esac
   if [ -z "$FB_KEY" ]; then

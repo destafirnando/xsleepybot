@@ -97,12 +97,13 @@ async function solveGroq(apiKey, imageUrl, model = 'llama-3.2-11b-vision-preview
   return parseSelected(text);
 }
 
-// Gemini - gratis (15 RPM free tier). Vision model: gemini-1.5-flash.
-async function solveGemini(apiKey, imageUrl) {
+// Gemini 2.5 Flash Lite - gratis, paling cepat (lebih cepat dari 1.5 flash).
+// Free tier ~15 RPM. Default fallback untuk Groq.
+async function solveGemini(apiKey, imageUrl, model = 'gemini-2.5-flash-lite') {
   const { buffer, contentType } = await api.fetchBytes(imageUrl);
   const b64 = buffer.toString('base64');
   const mimeType = contentType.includes('jpeg') ? 'image/jpeg' : 'image/png';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -120,7 +121,7 @@ async function solveGemini(apiKey, imageUrl) {
   });
   if (!res.ok) {
     const t = await res.text();
-    throw new Error(`Gemini ${res.status}: ${t.slice(0, 200)}`);
+    throw new Error(`Gemini(${model}) ${res.status}: ${t.slice(0, 200)}`);
   }
   const data = await res.json();
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -203,7 +204,9 @@ export async function solveWithVision({ provider, apiKey, imageUrl }) {
   switch (provider) {
     case 'groq':       return solveGroq(apiKey, imageUrl);
     case 'groq-90b':   return solveGroq(apiKey, imageUrl, 'llama-3.2-90b-vision-preview');
-    case 'gemini':     return solveGemini(apiKey, imageUrl);
+    case 'gemini':         return solveGemini(apiKey, imageUrl);
+    case 'gemini-flash':   return solveGemini(apiKey, imageUrl, 'gemini-2.5-flash');
+    case 'gemini-1.5':     return solveGemini(apiKey, imageUrl, 'gemini-1.5-flash');
     case 'openai':     return solveOpenAI(apiKey, imageUrl);
     case 'anthropic':  return solveAnthropic(apiKey, imageUrl);
     default:
