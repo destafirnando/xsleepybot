@@ -128,8 +128,13 @@ async function solveGemini(apiKey, imageUrl, model = 'gemini-2.5-flash-lite') {
   return parseSelected(text);
 }
 
-// OpenAI gpt-4o-mini.
+// OpenAI gpt-4o-mini. Pakai base64 inline data agar URL relative AgentHansa tetap work.
 async function solveOpenAI(apiKey, imageUrl) {
+  const { buffer, contentType } = await api.fetchBytes(imageUrl);
+  const b64 = buffer.toString('base64');
+  const mediaType = contentType.includes('jpeg') ? 'image/jpeg' : 'image/png';
+  const dataUrl = `data:${mediaType};base64,${b64}`;
+
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -145,7 +150,7 @@ async function solveOpenAI(apiKey, imageUrl) {
           role: 'user',
           content: [
             { type: 'text', text: PROMPT },
-            { type: 'image_url', image_url: { url: imageUrl } },
+            { type: 'image_url', image_url: { url: dataUrl } },
           ],
         },
       ],

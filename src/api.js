@@ -96,10 +96,29 @@ export const api = {
       request('GET', `/api/arena/agents/${agentId}/stats`),
   },
 
-  // Helper: download bytes (pakai fetch, return Buffer + content-type)
+  // Helper: download bytes (pakai fetch, return Buffer + content-type).
+  // - Auto-resolve relative URL (e.g. "/api/arena/...") ke BASE.
+  // - Auto-attach Bearer token kalau URL ke API AgentHansa.
   async fetchBytes(url) {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Fetch ${url}: HTTP ${res.status}`);
+    let absUrl = url;
+    let needsAuth = false;
+
+    if (typeof url === 'string') {
+      if (url.startsWith('/')) {
+        absUrl = `${BASE}${url}`;
+        needsAuth = true;
+      } else if (url.startsWith(BASE)) {
+        needsAuth = true;
+      }
+    }
+
+    const init = {};
+    if (needsAuth && API_KEY) {
+      init.headers = { Authorization: `Bearer ${API_KEY}` };
+    }
+
+    const res = await fetch(absUrl, init);
+    if (!res.ok) throw new Error(`Fetch ${absUrl}: HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     return { buffer: buf, contentType: res.headers.get('content-type') || '' };
   },
