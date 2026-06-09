@@ -1,24 +1,18 @@
-// CAPTCHA Master strategy v3 - Shared Answer Mode.
+// CAPTCHA Master strategy v5 - Optimized Shared Answer.
 //
-// KONSEP UTAMA:
-// 10 agent jalan di HP yang sama. Saat 1 agent berhasil solve CORRECT,
-// jawaban ditulis ke shared file. Agent lain yang belum submit bisa
-// langsung pakai jawaban tersebut tanpa buang waktu solve sendiri.
-//
-// FLOW per agent:
-// 1. Cek shared answer file dulu → kalau ada + fresh → submit langsung!
-// 2. Kalau belum ada → solve dengan Groq → submit
-// 3. Kalau CORRECT → tulis ke shared answer file
-// 4. Kalau WRONG → cek shared answer lagi (mungkin agent lain sudah solve)
-//    → retry dengan fallback Gemini
-//    → kalau CORRECT → tulis ke shared
-// 5. Loop: cek shared answer tiap 2 detik selama round masih berjalan
-//    (kalau agent lain belum submit, tunggu answer dari yang sudah correct)
-//
-// ANTI-RATE-LIMIT:
-// - Stagger 0-3s random di awal
-// - Cuma 2-3 agent yang benar-benar solve (sisanya tunggu answer)
-// - Hemat quota Groq + Gemini
+// IMPROVEMENT v5:
+// 1. Adaptive retry delay: 1s, 2s, 3s, 4s, 5s (bukan flat 3s)
+//    Total tetap 15s, tapi DAPAT puzzle lebih cepat kalau server seed cepet.
+// 2. Polling shared file 0.5s (was 2s) - lebih responsif tanpa API call extra.
+// 3. First-wave jitter 0-300ms (was 0-1000ms) - lebih cepat solve duluan.
+// 4. Skip jitter kalau pre-check sudah dapat shared = no waste time.
+// 5. Detailed timing log per phase: phase=t.0s/t.1s/etc untuk debug.
+// 6. Race-condition fix: writeSharedAnswer pakai atomic write (rename trick)
+//    biar dua agent tidak corrupt file barengan.
+// 7. Re-attempt submit even setelah cooldown 5s habis - shared answer punya
+//    chance update dari attempt agent lain.
+// 8. Concurrent shared poll DURING solver call (kalau Groq lambat 5s,
+//    cek shared tiap 0.5s sambil solver jalan, submit kalau dapat duluan).
 
 import { log } from '../logger.js';
 import { api } from '../api.js';
@@ -29,8 +23,7 @@ import path from 'node:path';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ====================================================================
-// Shared answer file management
-// Key = tournament_id + round_num → jawaban unik per round
+// Shared answer file management - lokasi: xsleepybot/shared/
 // ====================================================================
 const SHARED_DIR = path.resolve(process.cwd(), '..', '..', 'shared');
 
@@ -43,31 +36,33 @@ function readSharedAnswer(tournamentId, roundNum) {
     const file = sharedAnswerPath(tournamentId, roundNum);
     if (!fs.existsSync(file)) return null;
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    // Validate: must be recent (< 10 min), must have tiles array
     if (!Array.isArray(data.tiles) || data.tiles.length === 0) return null;
     const age = Date.now() - (data.timestamp || 0);
-    if (age > 10 * 60 * 1000) return null; // stale, ignore
+    if (age > 10 * 60 * 1000) return null;
     return data;
   } catch {
     return null;
   }
 }
 
+// Atomic write: write to .tmp then rename (POSIX rename = atomic)
 function writeSharedAnswer(tournamentId, roundNum, tiles, solver) {
   try {
     fs.mkdirSync(SHARED_DIR, { recursive: true });
     const file = sharedAnswerPath(tournamentId, roundNum);
+    const tmp = `${file}.${process.pid}.tmp`;
     const data = {
       tiles,
-      solver, // agent folder yang solve
+      solver,
       timestamp: Date.now(),
       tournamentId,
       roundNum,
     };
-    fs.writeFileSync(file, JSON.stringify(data));
-    log.ok(`[captcha] shared answer written: ${JSON.stringify(tiles)} by ${solver}`);
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, file);
+    log.ok(`[captcha] shared written: ${JSON.stringify(tiles)} by ${solver}`);
   } catch (e) {
-    log.warn(`[captcha] failed to write shared answer: ${e.message}`);
+    log.warn(`[captcha] failed write shared: ${e.message}`);
   }
 }
 
@@ -79,16 +74,18 @@ function cleanupOldShared() {
     for (const f of files) {
       if (!f.startsWith('captcha-')) continue;
       const full = path.join(SHARED_DIR, f);
-      const stat = fs.statSync(full);
-      if (now - stat.mtimeMs > 30 * 60 * 1000) {
-        fs.unlinkSync(full);
-      }
+      try {
+        const stat = fs.statSync(full);
+        if (now - stat.mtimeMs > 30 * 60 * 1000) {
+          fs.unlinkSync(full);
+        }
+      } catch { /* ignore */ }
     }
   } catch { /* ignore */ }
 }
 
 // ====================================================================
-// Provider chain builder
+// Provider chain
 // ====================================================================
 function buildProviders() {
   const list = [];
@@ -106,20 +103,56 @@ function buildProviders() {
 }
 
 // ====================================================================
-// Solve wrapper with timing
+// Solve with concurrent shared-poll (race solver vs shared)
+// Returns: { tiles, source }
+//   source = 'self' (solver succeed) | 'shared' (shared appeared first)
 // ====================================================================
-async function trySolve(provider, apiKey, imageUrl, label) {
+async function solveWithConcurrentSharedPoll({
+  provider, apiKey, imageUrl, label,
+  tournamentId, roundNum, agentLabel,
+}) {
   const t0 = Date.now();
-  try {
-    const tiles = await solveWithVision({ provider, apiKey, imageUrl });
-    const dt = ((Date.now() - t0) / 1000).toFixed(1);
-    log.ok(`[captcha] ${label} solved in ${dt}s -> ${JSON.stringify(tiles)}`);
-    return tiles;
-  } catch (e) {
-    const dt = ((Date.now() - t0) / 1000).toFixed(1);
-    log.warn(`[captcha] ${label} failed in ${dt}s: ${e.message}`);
-    return null;
+  let solverDone = false;
+  let solverResult = null;
+  let solverError = null;
+
+  // Solver (race competitor 1)
+  const solverPromise = (async () => {
+    try {
+      const tiles = await solveWithVision({ provider, apiKey, imageUrl });
+      solverResult = tiles;
+    } catch (e) {
+      solverError = e;
+    } finally {
+      solverDone = true;
+    }
+  })();
+
+  // Shared poller (race competitor 2)
+  while (!solverDone) {
+    const shared = readSharedAnswer(tournamentId, roundNum);
+    if (shared && shared.solver !== agentLabel) {
+      const dt = ((Date.now() - t0) / 1000).toFixed(1);
+      log.game(
+        `[captcha] shared appeared during ${label} solve at t+${dt}s -> use shared`,
+      );
+      return { tiles: shared.tiles, source: 'shared', sharedSolver: shared.solver };
+    }
+    await sleep(500);
   }
+
+  await solverPromise;
+  const dt = ((Date.now() - t0) / 1000).toFixed(1);
+
+  if (solverError) {
+    log.warn(`[captcha] ${label} failed in ${dt}s: ${solverError.message}`);
+    return { tiles: null, source: 'self-failed' };
+  }
+  if (solverResult) {
+    log.ok(`[captcha] ${label} solved in ${dt}s -> ${JSON.stringify(solverResult)}`);
+    return { tiles: solverResult, source: 'self' };
+  }
+  return { tiles: null, source: 'self-failed' };
 }
 
 // ====================================================================
@@ -148,19 +181,34 @@ async function submitAttempt(tournamentId, roundNum, tiles, attemptLabel) {
     }
     if (e.status === 429) {
       const cd = e.data?.cooldown_remaining_seconds || 5;
-      log.warn(`[captcha] cooldown (${attemptLabel}) wait ${cd}s`);
+      log.warn(`[captcha] cooldown 429 (${attemptLabel}) wait ${cd}s`);
       return { ok: false, cooldownSec: cd };
     }
     if (e.status === 503) {
-      log.warn(`[captcha] puzzle not loaded (${attemptLabel})`);
+      log.warn(`[captcha] puzzle not loaded 503 (${attemptLabel})`);
       return { ok: false, transient: true };
     }
-    throw e;
+    log.err(`[captcha] submit error (${attemptLabel}): ${e.message}`);
+    return { ok: false };
   }
 }
 
 // ====================================================================
-// Agent slot detection (sama seperti maze)
+// Helper: try-submit-shared (cek shared, kalau ada submit)
+// Returns true kalau submit success
+// ====================================================================
+async function trySubmitShared(tournamentId, roundNum, agentLabel, label, prevTiles = null) {
+  const shared = readSharedAnswer(tournamentId, roundNum);
+  if (!shared || shared.solver === agentLabel) return false;
+  if (prevTiles && JSON.stringify(shared.tiles) === JSON.stringify(prevTiles)) {
+    return false; // jangan submit jawaban sama yang sudah wrong
+  }
+  const r = await submitAttempt(tournamentId, roundNum, shared.tiles, label);
+  return r.ok;
+}
+
+// ====================================================================
+// Agent slot detection
 // ====================================================================
 function getAgentSlot() {
   const cwd = process.cwd();
@@ -177,38 +225,38 @@ function getAgentLabel() {
 // MAIN PLAY
 // ====================================================================
 export async function play({ tournamentId, roundNum }) {
+  const tStart = Date.now();
+  const elapsed = () => ((Date.now() - tStart) / 1000).toFixed(1);
   const agentLabel = getAgentLabel();
   const slot = getAgentSlot();
   const providers = buildProviders();
 
-  // Cleanup stale shared answers
   cleanupOldShared();
 
-  // ===== STEP 0: PRE-CHECK SHARED ANSWER =====
-  // Cek shared answer DULU sebelum tarik pairing/puzzle.
-  // Kalau ada → submit langsung, tidak butuh puzzle sama sekali!
-  const preShared = readSharedAnswer(tournamentId, roundNum);
-  if (preShared && preShared.solver !== agentLabel) {
-    log.game(
-      `[captcha] R${roundNum}: shared answer FOUND (pre-check) dari ${preShared.solver}: ${JSON.stringify(preShared.tiles)}`,
-    );
-    const r = await submitAttempt(tournamentId, roundNum, preShared.tiles, 'shared-precheck');
-    if (r.ok) return;
-    log.warn(`[captcha] shared answer wrong, fall through ke flow normal`);
-    if (r.cooldownSec) await sleep(r.cooldownSec * 1000 + 200);
+  log.game(`[captcha] R${roundNum}: PLAY START slot=${slot} t+0s`);
+
+  // ============================================================
+  // STEP 0: PRE-CHECK shared answer (instant submit kalau ada)
+  // ============================================================
+  if (await trySubmitShared(tournamentId, roundNum, agentLabel, 'shared-precheck')) {
+    log.ok(`[captcha] R${roundNum}: SHARED pre-check WIN at t+${elapsed()}s`);
+    return;
   }
 
-  // ===== STEP 1: FETCH PUZZLE dengan RETRY + polling shared =====
-  // Server kadang lambat seed puzzle. Retry sampai 5x sambil cek shared.
+  // ============================================================
+  // STEP 1: FETCH PUZZLE dengan adaptive retry
+  // Delay sequence: 1s, 2s, 3s, 4s, 5s = total 15s
+  // Sambil polling shared answer setiap retry
+  // ============================================================
   let pairing = null;
   let puzzle = null;
-  const PAIRING_RETRY = 5;
+  const RETRY_DELAYS = [1000, 2000, 3000, 4000, 5000]; // adaptive
 
-  for (let i = 0; i < PAIRING_RETRY; i++) {
+  for (let i = 0; i < RETRY_DELAYS.length; i++) {
     try {
       pairing = await api.arena.pairing(tournamentId, roundNum);
     } catch (e) {
-      log.warn(`[captcha] pairing fetch error attempt ${i + 1}: ${e.message}`);
+      log.warn(`[captcha] pairing fetch err try ${i + 1}: ${e.message}`);
     }
 
     if (pairing?.my_pairing?.is_bye || pairing?.is_bye) {
@@ -217,110 +265,150 @@ export async function play({ tournamentId, roundNum }) {
     }
 
     puzzle = pairing?.puzzle || pairing?.my_pairing?.puzzle;
-    if (puzzle) break;
+    if (puzzle) {
+      log.game(`[captcha] R${roundNum}: puzzle ready at t+${elapsed()}s (try ${i + 1})`);
+      break;
+    }
 
-    // No puzzle yet - check shared answer (mungkin agent lain sudah dapat)
-    const sharedDuringWait = readSharedAnswer(tournamentId, roundNum);
-    if (sharedDuringWait && sharedDuringWait.solver !== agentLabel) {
-      log.game(
-        `[captcha] R${roundNum}: no puzzle yet, but shared answer ada from ${sharedDuringWait.solver}: ${JSON.stringify(sharedDuringWait.tiles)}`,
-      );
-      const r = await submitAttempt(tournamentId, roundNum, sharedDuringWait.tiles, 'shared-no-puzzle');
-      if (r.ok) return;
-      if (r.cooldownSec) await sleep(r.cooldownSec * 1000 + 200);
+    // Poll shared during retry wait (every 250ms)
+    const waitEnd = Date.now() + RETRY_DELAYS[i];
+    while (Date.now() < waitEnd) {
+      if (await trySubmitShared(tournamentId, roundNum, agentLabel, 'shared-during-retry')) {
+        log.ok(`[captcha] R${roundNum}: SHARED during retry WIN at t+${elapsed()}s`);
+        return;
+      }
+      await sleep(250);
     }
 
     log.warn(
-      `[captcha] R${roundNum}: no puzzle (try ${i + 1}/${PAIRING_RETRY}) - server belum seed, wait 3s`,
+      `[captcha] R${roundNum}: no puzzle (try ${i + 1}/${RETRY_DELAYS.length}) waited ${RETRY_DELAYS[i]/1000}s`,
     );
-    await sleep(3000);
   }
 
+  // ============================================================
+  // STEP 2: Kalau puzzle masih kosong setelah 15s retry,
+  // poll shared 20 detik lagi (250ms interval)
+  // ============================================================
   if (!puzzle) {
-    log.warn(`[captcha] R${roundNum}: puzzle masih kosong setelah ${PAIRING_RETRY} retry`);
-    // Final wait loop: poll shared answer 20s
+    log.warn(`[captcha] R${roundNum}: puzzle EMPTY after retries, polling shared 20s...`);
     const waitEnd = Date.now() + 20_000;
     while (Date.now() < waitEnd) {
-      const shared = readSharedAnswer(tournamentId, roundNum);
-      if (shared && shared.solver !== agentLabel) {
-        log.ok(`[captcha] late shared answer found: ${JSON.stringify(shared.tiles)}`);
-        const r = await submitAttempt(tournamentId, roundNum, shared.tiles, 'shared-after-no-puzzle');
-        if (r.ok) return;
-        if (r.cooldownSec) await sleep(r.cooldownSec * 1000 + 200);
+      if (await trySubmitShared(tournamentId, roundNum, agentLabel, 'shared-no-puzzle')) {
+        log.ok(`[captcha] R${roundNum}: SHARED late WIN at t+${elapsed()}s`);
+        return;
       }
-      await sleep(2000);
+      await sleep(250);
     }
-    log.err(`[captcha] R${roundNum}: give up - no puzzle, no shared answer`);
+    log.err(`[captcha] R${roundNum}: GIVE UP - no puzzle, no shared`);
     return;
   }
 
-  // ===== STEP 2: Stagger berdasarkan slot wave =====
+  // ============================================================
+  // STEP 3: Stagger berdasarkan slot wave
+  // FIRST wave (odd slot): 0-300ms (cepat solve duluan)
+  // SECOND wave (even slot): 2000-3500ms (kasih waktu first wave solve dulu)
+  // SKIP jitter kalau shared sudah ada
+  // ============================================================
   const isFirstWave = slot % 2 === 1;
-  const jitterMs = isFirstWave
-    ? Math.floor(Math.random() * 1000)
-    : 3000 + Math.floor(Math.random() * 2000);
-
-  log.game(
-    `[captcha] R${roundNum}: slot=${slot} wave=${isFirstWave ? 'FIRST' : 'SECOND'} jitter=${jitterMs}ms`,
-  );
-  await sleep(jitterMs);
-
-  const existing2 = readSharedAnswer(tournamentId, roundNum);
-  if (existing2 && existing2.solver !== agentLabel) {
-    log.game(
-      `[captcha] R${roundNum}: shared answer appeared from ${existing2.solver}: ${JSON.stringify(existing2.tiles)}`,
-    );
-    const r = await submitAttempt(tournamentId, roundNum, existing2.tiles, 'shared-post-jitter');
-    if (r.ok) return;
-    if (r.cooldownSec) await sleep(r.cooldownSec * 1000 + 200);
+  let jitterMs;
+  if (isFirstWave) {
+    jitterMs = Math.floor(Math.random() * 300); // 0-300ms
+  } else {
+    jitterMs = 2000 + Math.floor(Math.random() * 1500); // 2000-3500ms
   }
 
-  // ===== STEP 3: Solve sendiri dengan primary provider =====
+  log.game(
+    `[captcha] R${roundNum}: t+${elapsed()}s wave=${isFirstWave ? 'FIRST' : 'SECOND'} jitter=${jitterMs}ms`,
+  );
+
+  // Polling shared selama jitter (kalau muncul, langsung submit)
+  if (jitterMs > 250) {
+    const waitEnd = Date.now() + jitterMs;
+    while (Date.now() < waitEnd) {
+      if (await trySubmitShared(tournamentId, roundNum, agentLabel, 'shared-during-jitter')) {
+        log.ok(`[captcha] R${roundNum}: SHARED during jitter WIN at t+${elapsed()}s`);
+        return;
+      }
+      await sleep(250);
+    }
+  } else {
+    await sleep(jitterMs);
+  }
+
+  // ============================================================
+  // STEP 4: Solve sendiri pakai primary (concurrent shared poll)
+  // ============================================================
   if (providers.length === 0) {
-    log.warn(`[captcha] no vision provider configured - skip`);
+    log.warn(`[captcha] no vision provider configured`);
     return;
   }
 
   const p1 = providers[0];
-  let tiles1 = await trySolve(p1.provider, p1.apiKey, puzzle.grid_image_url, p1.label);
+  log.game(`[captcha] R${roundNum}: t+${elapsed()}s solving with ${p1.label}...`);
+  const solve1 = await solveWithConcurrentSharedPoll({
+    ...p1, imageUrl: puzzle.grid_image_url,
+    tournamentId, roundNum, agentLabel,
+  });
 
-  if (!tiles1) {
-    const shared3 = readSharedAnswer(tournamentId, roundNum);
-    if (shared3 && shared3.solver !== agentLabel) {
-      log.game(`[captcha] primary failed, using shared answer: ${JSON.stringify(shared3.tiles)}`);
-      const r = await submitAttempt(tournamentId, roundNum, shared3.tiles, 'shared-after-fail');
-      if (r.ok) return;
-    }
-    if (providers.length > 1) {
-      const p2 = providers[1];
-      tiles1 = await trySolve(p2.provider, p2.apiKey, puzzle.grid_image_url, p2.label);
-    }
-    if (!tiles1) {
-      log.err(`[captcha] all solvers failed - waiting for shared answer`);
-      const waitEnd = Date.now() + 30_000;
-      while (Date.now() < waitEnd) {
-        await sleep(2000);
-        const shared = readSharedAnswer(tournamentId, roundNum);
-        if (shared && shared.solver !== agentLabel) {
-          log.ok(`[captcha] got shared answer while waiting: ${JSON.stringify(shared.tiles)}`);
-          await submitAttempt(tournamentId, roundNum, shared.tiles, 'shared-wait');
-          return;
-        }
-      }
-      log.err(`[captcha] no answer found after 30s wait - give up`);
+  if (solve1.source === 'shared') {
+    // Shared muncul DURING solve - submit shared
+    const r = await submitAttempt(tournamentId, roundNum, solve1.tiles, 'shared-during-solve');
+    if (r.ok) {
+      log.ok(`[captcha] R${roundNum}: SHARED during solve WIN at t+${elapsed()}s`);
       return;
     }
   }
 
-  // ===== STEP 4: Submit attempt 1 =====
+  let tiles1 = solve1.tiles;
+
+  // Kalau primary gagal (error), coba fallback provider untuk attempt 1
+  if (!tiles1 && providers.length > 1) {
+    log.warn(`[captcha] R${roundNum}: primary failed, try fallback for attempt-1`);
+
+    // Cek shared dulu sebelum fallback
+    if (await trySubmitShared(tournamentId, roundNum, agentLabel, 'shared-before-fallback')) {
+      log.ok(`[captcha] R${roundNum}: SHARED before fallback WIN`);
+      return;
+    }
+
+    const p2 = providers[1];
+    const solve2 = await solveWithConcurrentSharedPoll({
+      ...p2, imageUrl: puzzle.grid_image_url,
+      tournamentId, roundNum, agentLabel,
+    });
+    if (solve2.source === 'shared') {
+      const r = await submitAttempt(tournamentId, roundNum, solve2.tiles, 'shared-during-fallback');
+      if (r.ok) return;
+    }
+    tiles1 = solve2.tiles;
+  }
+
+  if (!tiles1) {
+    log.err(`[captcha] R${roundNum}: all solvers failed at t+${elapsed()}s, polling shared 30s`);
+    const waitEnd = Date.now() + 30_000;
+    while (Date.now() < waitEnd) {
+      if (await trySubmitShared(tournamentId, roundNum, agentLabel, 'shared-final-wait')) {
+        log.ok(`[captcha] R${roundNum}: SHARED final wait WIN at t+${elapsed()}s`);
+        return;
+      }
+      await sleep(500);
+    }
+    log.err(`[captcha] R${roundNum}: GIVE UP after 30s wait`);
+    return;
+  }
+
+  // ============================================================
+  // STEP 5: Submit attempt 1
+  // ============================================================
   const r1 = await submitAttempt(tournamentId, roundNum, tiles1, 'attempt1');
   if (r1.ok) {
     writeSharedAnswer(tournamentId, roundNum, tiles1, agentLabel);
+    log.ok(`[captcha] R${roundNum}: SELF-SOLVE WIN at t+${elapsed()}s`);
     return;
   }
 
   if (r1.transient) {
-    await sleep(3000);
+    await sleep(2000);
     const rRetry = await submitAttempt(tournamentId, roundNum, tiles1, 'attempt1-retry');
     if (rRetry.ok) {
       writeSharedAnswer(tournamentId, roundNum, tiles1, agentLabel);
@@ -329,59 +417,116 @@ export async function play({ tournamentId, roundNum }) {
     return;
   }
 
-  // ===== STEP 5: Wrong → poll shared during cooldown + fallback =====
+  // ============================================================
+  // STEP 6: WRONG → poll shared aggressively during cooldown
+  // ============================================================
   const cd1 = (r1.cooldownSec || 5) * 1000;
   const cdEnd = Date.now() + cd1;
 
+  log.game(`[captcha] R${roundNum}: WRONG, polling shared during ${cd1/1000}s cooldown...`);
   while (Date.now() < cdEnd) {
-    await sleep(1000);
-    const sharedMid = readSharedAnswer(tournamentId, roundNum);
-    if (sharedMid && sharedMid.solver !== agentLabel && JSON.stringify(sharedMid.tiles) !== JSON.stringify(tiles1)) {
+    const shared = readSharedAnswer(tournamentId, roundNum);
+    if (
+      shared && shared.solver !== agentLabel &&
+      JSON.stringify(shared.tiles) !== JSON.stringify(tiles1)
+    ) {
       log.game(
-        `[captcha] shared answer appeared during cooldown from ${sharedMid.solver}`,
+        `[captcha] R${roundNum}: shared appeared during cooldown from ${shared.solver}`,
       );
+      // Tunggu cooldown selesai
       const remaining = cdEnd - Date.now();
       if (remaining > 0) await sleep(remaining + 100);
-      const r = await submitAttempt(tournamentId, roundNum, sharedMid.tiles, 'shared-mid-cd');
-      if (r.ok) return;
-      break;
-    }
-  }
-
-  const shared4 = readSharedAnswer(tournamentId, roundNum);
-  if (shared4 && shared4.solver !== agentLabel && JSON.stringify(shared4.tiles) !== JSON.stringify(tiles1)) {
-    const r = await submitAttempt(tournamentId, roundNum, shared4.tiles, 'shared-post-cd');
-    if (r.ok) return;
-  }
-
-  // ===== STEP 6: Fallback solver (attempt 2) =====
-  if (providers.length > 1) {
-    const p2 = providers[1];
-    const tiles2 = await trySolve(p2.provider, p2.apiKey, puzzle.grid_image_url, p2.label);
-    if (tiles2 && JSON.stringify(tiles2) !== JSON.stringify(tiles1)) {
-      const r2 = await submitAttempt(tournamentId, roundNum, tiles2, 'attempt2');
-      if (r2.ok) {
-        writeSharedAnswer(tournamentId, roundNum, tiles2, agentLabel);
+      const r = await submitAttempt(tournamentId, roundNum, shared.tiles, 'shared-mid-cd');
+      if (r.ok) {
+        log.ok(`[captcha] R${roundNum}: SHARED mid-cd WIN at t+${elapsed()}s`);
         return;
       }
-      log.warn(`[captcha] attempt2 also wrong`);
-    } else if (tiles2) {
-      log.warn(`[captcha] attempt2 same as attempt1, skip`);
+      break;
     }
+    await sleep(250);
   }
 
-  // ===== STEP 7: Final wait — tunggu shared answer dari agent lain =====
-  log.game(`[captcha] both attempts failed, waiting shared answer (max 30s)...`);
-  const finalWaitEnd = Date.now() + 30_000;
-  while (Date.now() < finalWaitEnd) {
-    await sleep(2000);
-    const sharedFinal = readSharedAnswer(tournamentId, roundNum);
-    if (sharedFinal && sharedFinal.solver !== agentLabel && JSON.stringify(sharedFinal.tiles) !== JSON.stringify(tiles1)) {
-      log.ok(`[captcha] final shared answer from ${sharedFinal.solver}: ${JSON.stringify(sharedFinal.tiles)}`);
-      await submitAttempt(tournamentId, roundNum, sharedFinal.tiles, 'shared-final');
+  // Cek sekali lagi setelah cooldown
+  const shared4 = readSharedAnswer(tournamentId, roundNum);
+  if (
+    shared4 && shared4.solver !== agentLabel &&
+    JSON.stringify(shared4.tiles) !== JSON.stringify(tiles1)
+  ) {
+    const r = await submitAttempt(tournamentId, roundNum, shared4.tiles, 'shared-post-cd');
+    if (r.ok) {
+      log.ok(`[captcha] R${roundNum}: SHARED post-cd WIN at t+${elapsed()}s`);
       return;
     }
   }
 
-  log.warn(`[captcha] round ${roundNum} finished without correct answer`);
+  // ============================================================
+  // STEP 7: Fallback solver (attempt 2)
+  // ============================================================
+  if (providers.length > 1) {
+    const p2 = providers[1];
+    log.game(`[captcha] R${roundNum}: t+${elapsed()}s try fallback ${p2.label}...`);
+    const solve2 = await solveWithConcurrentSharedPoll({
+      ...p2, imageUrl: puzzle.grid_image_url,
+      tournamentId, roundNum, agentLabel,
+    });
+
+    if (solve2.source === 'shared') {
+      const r = await submitAttempt(tournamentId, roundNum, solve2.tiles, 'shared-during-fb');
+      if (r.ok) return;
+    }
+
+    if (solve2.tiles && JSON.stringify(solve2.tiles) !== JSON.stringify(tiles1)) {
+      const r2 = await submitAttempt(tournamentId, roundNum, solve2.tiles, 'attempt2');
+      if (r2.ok) {
+        writeSharedAnswer(tournamentId, roundNum, solve2.tiles, agentLabel);
+        log.ok(`[captcha] R${roundNum}: FALLBACK WIN at t+${elapsed()}s`);
+        return;
+      }
+      // Wrong fallback - tunggu cooldown lalu poll shared
+      if (r2.cooldownSec) {
+        const cd2End = Date.now() + r2.cooldownSec * 1000;
+        while (Date.now() < cd2End) {
+          if (await trySubmitShared(
+            tournamentId, roundNum, agentLabel, 'shared-mid-cd2',
+            tiles1, // jangan submit kalau sama dengan attempt1 yang udah wrong
+          )) {
+            log.ok(`[captcha] R${roundNum}: SHARED mid-cd2 WIN at t+${elapsed()}s`);
+            return;
+          }
+          await sleep(250);
+        }
+      }
+    } else if (solve2.tiles) {
+      log.warn(`[captcha] attempt2 same as attempt1, skip`);
+    }
+  }
+
+  // ============================================================
+  // STEP 8: Final wait for shared answer
+  // ============================================================
+  log.game(`[captcha] R${roundNum}: t+${elapsed()}s both attempts done, final wait 60s`);
+  const finalEnd = Date.now() + 60_000;
+  while (Date.now() < finalEnd) {
+    const shared = readSharedAnswer(tournamentId, roundNum);
+    if (
+      shared && shared.solver !== agentLabel &&
+      JSON.stringify(shared.tiles) !== JSON.stringify(tiles1)
+    ) {
+      log.ok(`[captcha] R${roundNum}: late shared from ${shared.solver}`);
+      const r = await submitAttempt(tournamentId, roundNum, shared.tiles, 'shared-final');
+      if (r.ok) {
+        log.ok(`[captcha] R${roundNum}: SHARED final WIN at t+${elapsed()}s`);
+        return;
+      }
+      // Mungkin masih cooldown
+      if (r.cooldownSec) {
+        await sleep(r.cooldownSec * 1000 + 200);
+        const rR = await submitAttempt(tournamentId, roundNum, shared.tiles, 'shared-final-retry');
+        if (rR.ok) return;
+      }
+    }
+    await sleep(500);
+  }
+
+  log.warn(`[captcha] R${roundNum}: ROUND END t+${elapsed()}s without correct answer`);
 }
