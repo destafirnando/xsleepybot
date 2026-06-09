@@ -1,0 +1,17 @@
+# Konfigurasi sensitif - JANGAN di-commit
+.env
+*.env.local
+
+# State & log
+state/
+logs/
+*.log
+
+# Node
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
