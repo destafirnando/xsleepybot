@@ -35,36 +35,53 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SHARED_DIR = path.resolve(process.cwd(), '..', '..', 'shared');
 const SOLVER_SLOTS = new Set([1, 2, 3, 4, 5]); // 5 solver, sisanya freerider
 
-// Solver-specific config: 5 solver dengan diversity berbeda.
-// Tiap solver pakai (provider, prompt, temperature) berbeda agar
-// kasih jawaban INDEPENDENT (probabilitas 4-5 wrong = sangat rendah).
+// Solver-specific config: freemodel (GPT-5.5) PRIORITAS UTAMA di slot 1-3.
+// Slot 4-5 = backup provider lain (groq/gemini) untuk diversity.
 const SOLVER_CONFIG = {
   1: {
-    provider: 'groq',
-    label: 'groq-default',
+    provider: 'freemodel',
+    label: 'freemodel-gpt55',
     opts: { temperature: 0, prompt: PROMPT_DEFAULT },
   },
   2: {
-    provider: 'groq',
-    label: 'groq-strict',
+    provider: 'freemodel',
+    label: 'freemodel-strict',
     opts: { temperature: 0, prompt: PROMPT_STRICT },
   },
   3: {
-    provider: 'groq',
-    label: 'groq-minimal',
-    opts: { temperature: 0.3, prompt: PROMPT_MINIMAL },
+    provider: 'freemodel-mini',
+    label: 'freemodel-mini',
+    opts: { temperature: 0, prompt: PROMPT_DEFAULT },
   },
   4: {
     provider: 'groq',
-    label: 'groq-temp07',
-    opts: { temperature: 0.7, prompt: PROMPT_DEFAULT },
+    label: 'groq-backup',
+    opts: { temperature: 0, prompt: PROMPT_DEFAULT },
   },
   5: {
     provider: 'gemini',
-    label: 'gemini-25lite',
+    label: 'gemini-backup',
     opts: { temperature: 0, prompt: PROMPT_DEFAULT },
   },
 };
+
+// Resolve API key per provider dari env.
+// FREEMODEL_API_KEY = prioritas utama (freemodel).
+// VISION_API_KEY = groq. VISION_FALLBACK_KEY = gemini.
+function resolveKey(provider) {
+  if (provider.startsWith('freemodel')) {
+    return process.env.FREEMODEL_API_KEY || process.env.VISION_API_KEY || '';
+  }
+  if (provider.startsWith('groq')) {
+    return process.env.GROQ_API_KEY || process.env.VISION_API_KEY || '';
+  }
+  if (provider.startsWith('gemini')) {
+    return process.env.GEMINI_API_KEY || process.env.VISION_FALLBACK_KEY || '';
+  }
+  if (provider.startsWith('openai')) return process.env.OPENAI_API_KEY || '';
+  if (provider.startsWith('anthropic')) return process.env.ANTHROPIC_API_KEY || '';
+  return process.env.VISION_API_KEY || '';
+}
 
 const GEMINI_COOLDOWN_FILE = path.join(SHARED_DIR, 'gemini-cooldown.txt');
 
@@ -292,13 +309,11 @@ async function playSolver(tournamentId, roundNum, agentLabel) {
     if (r.ok) return;
   }
 
-  // Determine API key based on provider
-  const apiKey = cfg.provider === 'gemini'
-    ? (process.env.VISION_FALLBACK_KEY || process.env.VISION_API_KEY)
-    : process.env.VISION_API_KEY;
+  // Determine API key based on provider (freemodel priority)
+  const apiKey = resolveKey(cfg.provider);
 
   if (!apiKey) {
-    log.err(`[captcha] no API key for provider ${cfg.provider}, fallback freerider`);
+    log.warn(`[captcha] no API key for ${cfg.provider}, fallback freerider`);
     return playFreerider(tournamentId, roundNum, agentLabel);
   }
 

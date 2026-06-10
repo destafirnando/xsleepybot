@@ -162,6 +162,46 @@ async function solveGemini(apiKey, imageUrl, opts = {}) {
   return parseSelected(text);
 }
 
+// Freemodel.dev - OpenAI-compatible, GPT-5 class (GRATIS). PRIORITAS UTAMA.
+// Endpoint: https://api.freemodel.dev/v1/chat/completions
+// Models: gpt-5.5 (best vision), gpt-5.4, gpt-5.4-mini (fast)
+async function solveFreemodel(apiKey, imageUrl, opts = {}) {
+  const { model = 'gpt-5.5', temperature = 0, prompt = PROMPT_DEFAULT } = opts;
+  const { buffer, contentType } = await api.fetchBytes(imageUrl);
+  const b64 = buffer.toString('base64');
+  const mediaType = contentType.includes('jpeg') ? 'image/jpeg' : 'image/png';
+  const dataUrl = `data:${mediaType};base64,${b64}`;
+
+  const res = await fetch('https://api.freemodel.dev/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 100,
+      temperature,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: dataUrl } },
+          ],
+        },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Freemodel(${model}) ${res.status}: ${t.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = data?.choices?.[0]?.message?.content || '';
+  return parseSelected(text);
+}
+
 // OpenAI gpt-4o-mini
 async function solveOpenAI(apiKey, imageUrl, opts = {}) {
   const { temperature = 0, prompt = PROMPT_DEFAULT } = opts;
@@ -243,6 +283,9 @@ async function solveAnthropic(apiKey, imageUrl, opts = {}) {
 export async function solveWithVision({ provider, apiKey, imageUrl, opts = {} }) {
   if (!apiKey) throw new Error(`No API key for provider=${provider}`);
   switch (provider) {
+    case 'freemodel':       return solveFreemodel(apiKey, imageUrl, opts);
+    case 'freemodel-mini':  return solveFreemodel(apiKey, imageUrl, { ...opts, model: 'gpt-5.4-mini' });
+    case 'freemodel-54':    return solveFreemodel(apiKey, imageUrl, { ...opts, model: 'gpt-5.4' });
     case 'groq':         return solveGroq(apiKey, imageUrl, opts);
     case 'groq-scout':   return solveGroq(apiKey, imageUrl, opts);
     // groq-maverick model 404 - fallback to scout

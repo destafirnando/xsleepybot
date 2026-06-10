@@ -49,6 +49,9 @@ ENABLED_GAMES=coin_snipe,crash_pilot,maze
 VISION_PROVIDER=none
 VISION_API_KEY=
 
+# FREEMODEL.DEV - PRIORITAS UTAMA solver captcha (GPT-5.5). Diisi via multi-setfreemodel.sh
+FREEMODEL_API_KEY=
+
 # Fallback provider (dipakai kalau primary wrong, attempt-2). Contoh: gemini.
 VISION_FALLBACK=
 VISION_FALLBACK_KEY=
