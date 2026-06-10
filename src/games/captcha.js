@@ -26,7 +26,7 @@
 
 import { log } from '../logger.js';
 import { api } from '../api.js';
-import { solveWithVision } from '../vision.js';
+import { solveWithVision, PROMPT_DETAILED } from '../vision.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -35,12 +35,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SHARED_DIR = path.resolve(process.cwd(), '..', '..', 'shared');
 const SOLVER_SLOTS = new Set([1, 2, 3, 4]); // 4 solver, sisanya freerider
 
-// Solver-specific config: tiap slot pakai model berbeda
+// Solver-specific config: tiap slot pakai variation berbeda untuk DIVERSITY.
+// Kunci: kombinasi (provider, temperature, prompt) yang berbeda agar model
+// kasih jawaban INDEPENDENT - bukan deterministik sama semua.
 const SOLVER_CONFIG = {
-  1: { provider: 'groq',         model: 'meta-llama/llama-4-scout-17b-16e-instruct', label: 'groq-scout' },
-  2: { provider: 'groq',         model: 'meta-llama/llama-4-maverick-17b-128e-instruct', label: 'groq-maverick' },
-  3: { provider: 'groq',         model: 'meta-llama/llama-4-scout-17b-16e-instruct', label: 'groq-scout-v2', altPrompt: true },
-  4: { provider: 'gemini',       model: 'gemini-2.5-flash-lite', label: 'gemini-25lite' },
+  1: {
+    provider: 'groq',
+    label: 'groq-default',
+    opts: { temperature: 0 },
+  },
+  2: {
+    provider: 'groq',
+    label: 'groq-temp05',
+    opts: { temperature: 0.5 },
+  },
+  3: {
+    provider: 'groq',
+    label: 'groq-detailed',
+    opts: { temperature: 0, prompt: PROMPT_DETAILED },
+  },
+  4: {
+    provider: 'gemini',
+    label: 'gemini-25lite',
+    opts: { temperature: 0 },
+  },
 };
 
 const GEMINI_COOLDOWN_FILE = path.join(SHARED_DIR, 'gemini-cooldown.txt');
@@ -156,19 +174,11 @@ function getAgentLabel() {
 // ====================================================================
 // Solver helpers
 // ====================================================================
-async function trySolveWithModel(provider, apiKey, imageUrl, label, model, altPrompt) {
+async function trySolveWithModel(provider, apiKey, imageUrl, label, opts) {
   const t0 = Date.now();
   try {
-    // solveWithVision menerima provider name. Untuk slot 1-3 yang pakai groq tapi model beda,
-    // kita perlu cara override model. Saat ini provider 'groq' default scout, 'groq-90b' alias maverick.
-    // Kita pakai 'groq-scout', 'groq-maverick' yang sudah ada di vision.js
-    let actualProvider = provider;
-    if (provider === 'groq' && model && model.includes('maverick')) {
-      actualProvider = 'groq-maverick';
-    }
-
     const tiles = await solveWithVision({
-      provider: actualProvider, apiKey, imageUrl,
+      provider, apiKey, imageUrl, opts: opts || {},
     });
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
     log.ok(`[captcha] ${label} solved in ${dt}s -> ${JSON.stringify(tiles)}`);
@@ -330,7 +340,7 @@ async function playSolver(tournamentId, roundNum, agentLabel) {
   log.game(`[captcha] R${roundNum} t+${elapsed()}s solving with ${cfg.label}...`);
 
   let tiles = await trySolveWithModel(
-    cfg.provider, apiKey, puzzle.grid_image_url, cfg.label, cfg.model, cfg.altPrompt,
+    cfg.provider, apiKey, puzzle.grid_image_url, cfg.label, cfg.opts,
   );
 
   if (tiles && isKnownWrong(tiles, wrongList)) {
