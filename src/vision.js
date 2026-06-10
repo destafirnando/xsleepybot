@@ -5,7 +5,7 @@
 import { api } from './api.js';
 
 // =====================================================================
-// PROMPTS - 2 variasi untuk diversity
+// PROMPTS - 3 variasi untuk diversity (Default + Strict + Minimal)
 // =====================================================================
 const PROMPT_DEFAULT = `Look at this 3x3 captcha grid. Tiles are indexed 0..8 row-major.
 Layout:
@@ -24,39 +24,54 @@ Reply with ONLY a JSON array of integer indices, sorted ascending.
 Example: [0,3,7]
 No prose. No markdown. Just the JSON array on a single line.`;
 
-// Prompt B - pendekatan per-tile (analisa satu-satu)
-const PROMPT_DETAILED = `This is a 3x3 captcha grid with 9 tiles indexed 0..8:
-  Top row:    tile 0, tile 1, tile 2
-  Middle row: tile 3, tile 4, tile 5
-  Bottom row: tile 6, tile 7, tile 8
+// PROMPT B - STRICT alternative reasoning, NO step-by-step
+const PROMPT_STRICT = `Task: Identify tiles in 3x3 grid containing target object.
+Header text tells you what object to find.
+Tiles indexed 0-8 (row-major: top-left=0, top-right=2, bottom-right=8).
 
-Step 1: Read the header text at top of image. What object are you asked to find?
+CRITICAL: Your entire response must be ONLY a JSON array. No words, no explanation.
+Just brackets and numbers. Like: [0,2,5]
 
-Step 2: Examine EACH of the 9 tiles individually. For each tile, ask:
-  "Does this tile contain the target object (even partially)?"
+If unsure about a tile, INCLUDE it (better false-positive than miss).
+If header asks for X but tile shows partial X, INCLUDE that tile.
 
-Step 3: Output ONLY the indices that contain the object as JSON array.
-Example output: [1,4,7]
+Output format: [<numbers>]
+Output now:`;
 
-Be strict: include partial appearances but exclude tiles where you're unsure.
-Output ONE LINE only - just the JSON array, no other text.`;
+// PROMPT C - MINIMAL (radikal pendek, force concise)
+const PROMPT_MINIMAL = `3x3 captcha. Header says what to find. Tiles 0-8 (row-major).
+Output JSON array only. Example: [1,4,7]
+Answer:`;
 
 // =====================================================================
-// Parse helper
+// Parse helper - LENIENT mode handles prose-prefix output
 // =====================================================================
 function parseSelected(text) {
   if (!text || typeof text !== 'string') {
     throw new Error(`Empty response`);
   }
-  const m = text.match(/\[[\s\d,]*\]/);
-  if (!m) throw new Error(`No JSON array in: ${text.slice(0, 120)}`);
+  // Cari SEMUA JSON array, ambil yang terakhir (biasanya answer final)
+  const matches = [...text.matchAll(/\[[\s\d,]*\]/g)];
+  if (matches.length === 0) {
+    // Fallback: cari angka individual yang valid (e.g. "tiles 1, 4, 7")
+    const nums = text.match(/\b[0-8]\b/g);
+    if (nums && nums.length > 0 && nums.length <= 9) {
+      const arr = nums.map(Number).filter((n) => n >= 0 && n <= 8);
+      if (arr.length > 0) {
+        return [...new Set(arr)].sort((a, b) => a - b);
+      }
+    }
+    throw new Error(`No JSON array in: ${text.slice(0, 120)}`);
+  }
+  // Pakai array TERAKHIR (biasanya answer setelah reasoning prose)
+  const m = matches[matches.length - 1][0];
   let arr;
   try {
-    arr = JSON.parse(m[0]);
+    arr = JSON.parse(m);
   } catch (e) {
-    throw new Error(`Parse fail: ${m[0]}`);
+    throw new Error(`Parse fail: ${m}`);
   }
-  if (!Array.isArray(arr)) throw new Error(`Not array: ${m[0]}`);
+  if (!Array.isArray(arr)) throw new Error(`Not array: ${m}`);
   return [
     ...new Set(
       arr.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 8),
@@ -244,7 +259,7 @@ export async function solveWithVision({ provider, apiKey, imageUrl, opts = {} })
 }
 
 // Export prompts untuk dipakai di captcha.js
-export { PROMPT_DEFAULT, PROMPT_DETAILED };
+export { PROMPT_DEFAULT, PROMPT_STRICT, PROMPT_MINIMAL };
 
 // =====================================================================
 // Multi-provider chain - coba primary, kalau fail fallback

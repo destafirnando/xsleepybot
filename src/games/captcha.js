@@ -26,38 +26,43 @@
 
 import { log } from '../logger.js';
 import { api } from '../api.js';
-import { solveWithVision, PROMPT_DETAILED } from '../vision.js';
+import { solveWithVision, PROMPT_DEFAULT, PROMPT_STRICT, PROMPT_MINIMAL } from '../vision.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const SHARED_DIR = path.resolve(process.cwd(), '..', '..', 'shared');
-const SOLVER_SLOTS = new Set([1, 2, 3, 4]); // 4 solver, sisanya freerider
+const SOLVER_SLOTS = new Set([1, 2, 3, 4, 5]); // 5 solver, sisanya freerider
 
-// Solver-specific config: tiap slot pakai variation berbeda untuk DIVERSITY.
-// Kunci: kombinasi (provider, temperature, prompt) yang berbeda agar model
-// kasih jawaban INDEPENDENT - bukan deterministik sama semua.
+// Solver-specific config: 5 solver dengan diversity berbeda.
+// Tiap solver pakai (provider, prompt, temperature) berbeda agar
+// kasih jawaban INDEPENDENT (probabilitas 4-5 wrong = sangat rendah).
 const SOLVER_CONFIG = {
   1: {
     provider: 'groq',
     label: 'groq-default',
-    opts: { temperature: 0 },
+    opts: { temperature: 0, prompt: PROMPT_DEFAULT },
   },
   2: {
     provider: 'groq',
-    label: 'groq-temp05',
-    opts: { temperature: 0.5 },
+    label: 'groq-strict',
+    opts: { temperature: 0, prompt: PROMPT_STRICT },
   },
   3: {
     provider: 'groq',
-    label: 'groq-detailed',
-    opts: { temperature: 0, prompt: PROMPT_DETAILED },
+    label: 'groq-minimal',
+    opts: { temperature: 0.3, prompt: PROMPT_MINIMAL },
   },
   4: {
+    provider: 'groq',
+    label: 'groq-temp07',
+    opts: { temperature: 0.7, prompt: PROMPT_DEFAULT },
+  },
+  5: {
     provider: 'gemini',
     label: 'gemini-25lite',
-    opts: { temperature: 0 },
+    opts: { temperature: 0, prompt: PROMPT_DEFAULT },
   },
 };
 
