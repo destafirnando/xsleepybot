@@ -1,68 +1,71 @@
-// Maze Runner v6 - "Push to Survive" strategy.
+// Maze Runner v8 - "PUSH FAR" strategy.
 //
-// LESSONS LEARNED dari tournament data analysis (TID 615f7d13):
-// - Top 23 survivors R1: score 95-169
-// - Median R1 cutoff: ~95 score (dist 9 + tile 5)
-// - Top 8 score 127+: dist 12-14
-// - Bot defensive (target 7, score 70) = DI BAWAH median = eliminated R1
+// LESSON LEARNED from production R1 log (14:00):
+// - Bot v6 stop di dist 1-5 dengan HP masih banyak (47!)
+// - Trigger: high-cost detection (2 tile cost > 13 berturut)
+// - Tapi tile cost 13+ itu NORMAL (30% tile distribution)
+// - Bot terlalu paranoid -> stop dini -> stuck di ring crowded center
 //
-// FIX v6 - prioritas SURVIVAL via DIST yang cukup:
-// - Target dist 11 (score 110+) untuk LEWAT median R1
-// - Mode push: target 13 untuk top 30%
-// - Mode aggressive: target 15 untuk top 10%
+// Agent yang menang (Hoz: dist 13+, score 169) PUSH SAMPAI EDGE.
+// Mereka TIDAK stop di high-cost - mereka terus push.
 //
-// PRINSIP YANG TETAP DARI v5:
-// 1. Strict wall avoidance (no bump)
-// 2. High-cost zone detection (stop di 2 cost > 12 berturut)
-// 3. NO random exit (buang HP)
-// 4. Phase 2 dodge max 2 step
+// Ratusan agent kompetitor cluster di dist 1-5 (sama strategy bot v6).
+// Tile collapse 100% di area itu. Score = 0.
+//
+// FIX v8 - "PUSH FAR ESCAPE":
+//
+// 1. HPFloor 30 (was 40-75) - lebih agresif push
+// 2. Death-zone hanya MAX_TILE+1=51 (was +5) - hampir no safety margin
+// 3. HAPUS high-cost-zone stop (was 2 cost > 13 = stop)
+//    Tile mahal 11-30 NORMAL, bukan terror.
+//    Hanya stop kalau cost >= 35 (real terror tile)
+// 4. HAPUS DODGE PHASE - dodge cuma geser ke tile crowded sebelah
+//    Solution: push lebih jauh ke ring yang lebih sepi
+// 5. Chain 2-3 step kalau HP > 50 (push faster)
+//
+// PHILOSOPHY: di tournament 400 agent, RING DEKAT CENTER = OVERCROWDED.
+// RING JAUH (dist 11+) = lebih sedikit agent yang berhasil sampai = lebih aman.
 
 import { log } from '../logger.js';
 import { api } from '../api.js';
 
 // ====================================================================
 const MAX_TILE = 50;
-const SCAN_COST = 5;
+const TERROR_THRESHOLD = 35; // hanya stop kalau ketemu terror tile (top 10% values)
 
-// MODE configuration - TARGET DIST DINAIKAN agar lewat median (95)
 const CONFIG = {
-  // 'survive' = NEW DEFAULT - target lewat median R1
+  // 'survive' = push aggressive untuk LEWAT median 95
   survive: {
-    targetDist: 11,
-    hpFloor: 40,    // turun dari 75 → 40 supaya bisa push lebih jauh
-    pushExtension: 1, // extend ke 12 kalau HP banyak
-    maxDodge: 2,
+    targetDist: 12,
+    hpFloor: 30,
+    pushExtension: 2,
     label: 'SURVIVE',
   },
   // 'push' = top 30%
   push: {
-    targetDist: 13,
-    hpFloor: 30,
+    targetDist: 14,
+    hpFloor: 25,
     pushExtension: 1,
-    maxDodge: 2,
     label: 'PUSH',
   },
   // 'aggressive' = top 10%
   aggressive: {
-    targetDist: 15,
+    targetDist: 16,
     hpFloor: 20,
     pushExtension: 0,
-    maxDodge: 1,
     label: 'AGGRESSIVE',
   },
-  // Backward compat
-  defensive: {  // alias untuk survive
-    targetDist: 11,
-    hpFloor: 40,
-    pushExtension: 1,
-    maxDodge: 2,
+  // backward compat aliases
+  defensive: {
+    targetDist: 12,
+    hpFloor: 30,
+    pushExtension: 2,
     label: 'SURVIVE',
   },
-  safe: {  // alias untuk push moderate
-    targetDist: 12,
-    hpFloor: 35,
+  safe: {
+    targetDist: 13,
+    hpFloor: 28,
     pushExtension: 1,
-    maxDodge: 2,
     label: 'SAFE',
   },
 };
@@ -70,21 +73,21 @@ const CONFIG = {
 const OPP = { W: 'S', S: 'W', A: 'D', D: 'A' };
 
 const CORNERS = {
-  N:  { dirs: ['W', 'W'], primary: 'W', perp: ['A', 'D'] },
-  NE: { dirs: ['W', 'D'], primary: 'W', perp: ['A', 'S'] },
-  E:  { dirs: ['D', 'D'], primary: 'D', perp: ['W', 'S'] },
-  SE: { dirs: ['S', 'D'], primary: 'S', perp: ['W', 'A'] },
-  S:  { dirs: ['S', 'S'], primary: 'S', perp: ['A', 'D'] },
-  SW: { dirs: ['S', 'A'], primary: 'S', perp: ['W', 'D'] },
-  W:  { dirs: ['A', 'A'], primary: 'A', perp: ['W', 'S'] },
-  NW: { dirs: ['W', 'A'], primary: 'W', perp: ['S', 'D'] },
+  N:  { dirs: ['W', 'W'] },
+  NE: { dirs: ['W', 'D'] },
+  E:  { dirs: ['D', 'D'] },
+  SE: { dirs: ['S', 'D'] },
+  S:  { dirs: ['S', 'S'] },
+  SW: { dirs: ['S', 'A'] },
+  W:  { dirs: ['A', 'A'] },
+  NW: { dirs: ['W', 'A'] },
 };
 const CORNER_KEYS = Object.keys(CORNERS);
 
 function getAgentSlot() {
   const cwd = process.cwd();
-  const match = cwd.match(/agents[\/\\](\d+)$/);
-  if (match) return parseInt(match[1], 10);
+  const m = cwd.match(/agents[\/\\](\d+)$/);
+  if (m) return parseInt(m[1], 10);
   const key = process.env.AGENTHANSA_API_KEY || 'fallback';
   let h = 0;
   for (const c of key) h = (h * 31 + c.charCodeAt(0)) | 0;
@@ -133,60 +136,42 @@ function neighStatus(nb, dir) {
   return 'unknown';
 }
 
-function isOpenable(nb, dir, strict = false) {
-  const s = neighStatus(nb, dir);
-  if (strict) return s === 'open';
-  return s !== 'wall';
+function isOpen(nb, dir) {
+  return neighStatus(nb, dir) === 'open';
 }
 
-function nextStep(nb, pattern, lastDir, blocked = new Set()) {
+function isNotWall(nb, dir) {
+  return neighStatus(nb, dir) !== 'wall';
+}
+
+// Pilih next step - prefer corner direction, hindari wall
+function nextStep(nb, pattern, lastDir) {
   const primary = pattern[0];
   const alt = pattern[1];
 
-  // Strict pass
+  // Strict: confirmed open
   for (const d of [primary, alt]) {
-    if (blocked.has(d)) continue;
-    if (isOpenable(nb, d, true)) return { dir: d, confidence: 'high' };
+    if (isOpen(nb, d)) return { dir: d, confidence: 'high' };
   }
 
+  // Perpendicular still strict open
   const perp = primary === 'W' || primary === 'S' ? ['A', 'D'] : ['W', 'S'];
   for (const d of perp) {
-    if (blocked.has(d)) continue;
     if (d === OPP[lastDir]) continue;
-    if (isOpenable(nb, d, true)) return { dir: d, confidence: 'medium' };
+    if (isOpen(nb, d)) return { dir: d, confidence: 'medium' };
   }
 
-  // Lenient (accept unknown)
+  // Lenient: accept unknown
   for (const d of [primary, alt, ...perp]) {
-    if (blocked.has(d)) continue;
     if (d === OPP[lastDir]) continue;
-    if (isOpenable(nb, d, false)) return { dir: d, confidence: 'low' };
+    if (isNotWall(nb, d)) return { dir: d, confidence: 'low' };
   }
 
+  // Last resort
   for (const d of ['W', 'A', 'S', 'D']) {
-    if (blocked.has(d)) continue;
-    return { dir: d, confidence: 'desperate' };
+    if (isNotWall(nb, d)) return { dir: d, confidence: 'desperate' };
   }
   return { dir: primary, confidence: 'fallback' };
-}
-
-function dodgeStep(nb, pattern, lastDir, attemptN = 0) {
-  const primary = pattern[0];
-  const perp = primary === 'W' || primary === 'S' ? ['A', 'D'] : ['W', 'S'];
-  let candidates;
-  switch (attemptN) {
-    case 0: candidates = perp; break;
-    case 1: candidates = [pattern[1], primary]; break;
-    default: candidates = ['W', 'A', 'S', 'D'];
-  }
-  for (const d of candidates) {
-    if (d === OPP[lastDir]) continue;
-    if (isOpenable(nb, d, true)) return d;
-  }
-  for (const d of candidates) {
-    if (isOpenable(nb, d, false)) return d;
-  }
-  return primary;
 }
 
 function distFromCenter(x, y) {
@@ -196,16 +181,10 @@ function distFromCenter(x, y) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ====================================================================
-// MAIN PLAY
-// ====================================================================
 export async function play({ tournamentId, roundNum, roundEndsAt }) {
-  // DEFAULT mode = 'survive' (was 'defensive' di v5)
   const mode = (process.env.MAZE_MODE || 'survive').toLowerCase();
   const cfg = CONFIG[mode] || CONFIG.survive;
-
-  // Mutable copy biar bisa adaptive extend tanpa korup CONFIG global
-  const targetDist = cfg.targetDist;
-  let effectiveTarget = targetDist;
+  let effectiveTarget = cfg.targetDist;
   let extended = false;
 
   const slot = getAgentSlot();
@@ -213,8 +192,8 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
   const pattern = CORNERS[corner].dirs;
 
   log.game(
-    `[maze] R${roundNum}: ${cfg.label} v6 | slot=${slot} corner=${corner} ` +
-      `pattern=${pattern.join('')} target=${targetDist} floor=${cfg.hpFloor}`,
+    `[maze] R${roundNum}: ${cfg.label} v8 | slot=${slot} corner=${corner} ` +
+      `pattern=${pattern.join('')} target=${effectiveTarget} floor=${cfg.hpFloor}`,
   );
 
   let pairing;
@@ -229,9 +208,8 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
     log.game(`[maze] R${roundNum}: BYE`);
     return;
   }
-
   if (pairing?.eliminated || pairing?.my_pairing?.eliminated) {
-    log.warn(`[maze] R${roundNum}: ELIMINATED already, skip`);
+    log.warn(`[maze] R${roundNum}: ELIMINATED, skip`);
     return;
   }
 
@@ -241,45 +219,40 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
   let neighborhood = ms.neighborhood || null;
   let lastDir = null;
   let isDead = false;
-  let consecutiveHighCost = 0;
   let stepCount = 0;
+  let terrorHit = 0; // counter terror tile (>= 35 HP cost)
 
   const endTime = roundEndsAt
     ? new Date(roundEndsAt).getTime()
     : Date.now() + 9.5 * 60 * 1000;
 
-  const phase1Deadline = endTime - 60_000; // reserve 60s for phase 2
+  // Reserve 30s buffer (TIDAK ada phase 2 dodge - lebih banyak waktu push)
+  const phase1Deadline = endTime - 30_000;
 
-  // ==== PHASE 1: PUSH PUSH PUSH (target 11+) ====
+  // ==== PHASE 1: PUSH FAR ====
   while (!isDead && Date.now() < phase1Deadline) {
     const dist = distFromCenter(pos[0], pos[1]);
 
-    // STOP: HP critical
+    // Stop conditions - LEBIH MINIMAL
     if (hp <= cfg.hpFloor) {
       log.game(`[maze] HP=${hp.toFixed(1)} <= floor ${cfg.hpFloor}, STOP at dist=${dist}`);
       break;
     }
-    // STOP: death-zone (1 spike tile = mati)
-    if (hp <= MAX_TILE + 5) {
+    // Death-zone: 1 spike tile bisa langsung mati
+    if (hp <= MAX_TILE + 1) {
       log.warn(`[maze] death-zone HP=${hp.toFixed(1)}, STOP at dist=${dist}`);
       break;
     }
-    // STOP: high-cost zone (2 step berturut > 12 HP)
-    // Tolerance lebih tinggi dari v5 (was 10) supaya tidak terlalu cepat stop
-    if (consecutiveHighCost >= 2) {
-      log.warn(`[maze] HIGH-COST zone (2 consec >12HP), STOP at dist=${dist} hp=${hp.toFixed(1)}`);
+    // Stop kalau kena 2 terror tile berturut (cost >= 35)
+    if (terrorHit >= 2) {
+      log.warn(`[maze] 2 TERROR tiles hit, STOP at dist=${dist} hp=${hp.toFixed(1)}`);
       break;
     }
 
     // Target reached?
     if (dist >= effectiveTarget) {
-      // Adaptive extend kalau HP masih banyak
-      if (
-        !extended &&
-        cfg.pushExtension > 0 &&
-        hp >= cfg.hpFloor + 25 &&
-        stepCount < 18
-      ) {
+      // Adaptive extend
+      if (!extended && cfg.pushExtension > 0 && hp >= cfg.hpFloor + 20) {
         effectiveTarget += cfg.pushExtension;
         extended = true;
         log.game(`[maze] hit target, HP=${hp.toFixed(1)} ample, extend to ${effectiveTarget}`);
@@ -289,10 +262,11 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
       }
     }
 
-    // Chain length:
-    //  - HP buffer >= floor+30: chain 2
-    //  - else: chain 1 (hati-hati)
-    let chainLen = hp >= cfg.hpFloor + 30 ? 2 : 1;
+    // Chain length: AGRESIF push kalau HP banyak
+    let chainLen;
+    if (hp >= cfg.hpFloor + 50) chainLen = 3;
+    else if (hp >= cfg.hpFloor + 25) chainLen = 2;
+    else chainLen = 1;
 
     const { dir, confidence } = nextStep(neighborhood, pattern, lastDir);
 
@@ -304,8 +278,12 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
     const chain = [dir];
     if (chainLen >= 2 && confidence === 'high') {
       const altDir = pattern[1];
-      if (isOpenable(neighborhood, altDir, false)) {
+      if (isNotWall(neighborhood, altDir)) {
         chain.push(altDir);
+        if (chainLen >= 3) {
+          // 3rd step blind, but we're optimistic - HP buffer cukup
+          chain.push(pattern[0]);
+        }
       }
     }
 
@@ -343,13 +321,15 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
     const cost = hpBefore - hp;
     stepCount++;
 
-    if (cost >= 13) consecutiveHighCost++;
-    else consecutiveHighCost = 0;
+    // Track terror tile (cost >= 35 = top 10% mahal)
+    if (cost >= TERROR_THRESHOLD) terrorHit++;
+    else terrorHit = 0; // reset counter kalau cheap tile
 
     log.game(
       `[maze] STEP${stepCount} ${chain.join('')} pos=(${pos.join(',')}) hp=${hp.toFixed(1)} ` +
         `dist=${distFromCenter(pos[0], pos[1])} cost=${cost.toFixed(1)}` +
-        (bumped ? ' [WALL_BUMP!]' : '') + ` conf=${confidence}`,
+        (bumped ? ' [WALL_BUMP!]' : '') + ` conf=${confidence}` +
+        (cost >= TERROR_THRESHOLD ? ' [TERROR!]' : ''),
     );
 
     if (isDead) {
@@ -358,8 +338,8 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
     }
 
     if (bumped) {
-      log.warn(`[maze] WALL_BUMP - neighborhood data was stale`);
-      consecutiveHighCost = 2;
+      // Wall bump = waste 20 HP. Stop chain length next iteration.
+      log.warn(`[maze] WALL_BUMP - reduce chain next step`);
     }
 
     lastDir = chain[chain.length - 1];
@@ -373,99 +353,12 @@ export async function play({ tournamentId, roundNum, roundEndsAt }) {
   }
 
   const finalDist = distFromCenter(pos[0], pos[1]);
-  log.game(
-    `[maze] PUSH DONE: pos=(${pos.join(',')}) hp=${hp.toFixed(1)} dist=${finalDist} steps=${stepCount}`,
-  );
-
-  // ==== PHASE 2: ANTI-COLLAPSE (max 2 dodge) ====
-  let dodgeCount = 0;
-
-  while (
-    !isDead &&
-    hp >= SCAN_COST + 15 &&
-    Date.now() < endTime - 10_000 &&
-    dodgeCount < cfg.maxDodge
-  ) {
-    try {
-      await sleep(1100);
-      const check = await api.arena.mazeCheck(tournamentId, roundNum);
-      const occupants = Number(check.tile_occupants ?? 1);
-      hp = Number(check.health_left ?? hp - SCAN_COST);
-      isDead = check.is_dead === true;
-
-      log.game(`[maze] SCAN occupants=${occupants} hp=${hp.toFixed(1)}`);
-
-      if (isDead) {
-        log.err(`[maze] DIED on scan`);
-        return;
-      }
-      if (occupants <= 1) {
-        log.ok(`[maze] tile CLEAR`);
-        break;
-      }
-
-      const collapseRisk = Math.min(1, (occupants - 1) * 0.25);
-      if (hp < 25) {
-        log.warn(
-          `[maze] HP=${hp.toFixed(1)} too low to dodge, accept ${(collapseRisk * 100).toFixed(0)}% risk`,
-        );
-        break;
-      }
-
-      if (check.cooldown_until) {
-        const wait = new Date(check.cooldown_until).getTime() - Date.now();
-        if (wait > 0) await sleep(wait + 50);
-      } else {
-        await sleep(1100);
-      }
-
-      const dodge = dodgeStep(neighborhood, pattern, lastDir, dodgeCount);
-      log.game(
-        `[maze] DODGE${dodgeCount + 1} ${dodge} (occupants=${occupants}, risk=${(collapseRisk*100).toFixed(0)}%)`,
-      );
-
-      try {
-        const dRes = await api.arena.submitMaze(tournamentId, roundNum, dodge);
-        pos = dRes.final_position || pos;
-        hp = Number(dRes.health_left ?? hp);
-        isDead = dRes.is_dead === true;
-        if (Array.isArray(dRes.moves)) {
-          for (const m of dRes.moves) {
-            if (m.neighborhood) neighborhood = m.neighborhood;
-          }
-        }
-        if (isDead) {
-          log.err(`[maze] DIED on dodge`);
-          return;
-        }
-        lastDir = dodge;
-      } catch (e) {
-        if (e.status === 403 || /eliminated/i.test(e.message)) {
-          log.warn(`[maze] eliminated during dodge`);
-          break;
-        }
-        log.warn(`[maze] dodge error: ${e.message}`);
-        break;
-      }
-      dodgeCount++;
-    } catch (e) {
-      if (e.status === 403 || /eliminated/i.test(e.message)) {
-        log.warn(`[maze] eliminated during scan`);
-        break;
-      }
-      log.warn(`[maze] scan error: ${e.message}`);
-      break;
-    }
-  }
-
-  if (dodgeCount > 0 && !isDead) {
-    log.game(`[maze] anti-collapse: ${dodgeCount} dodge done`);
-  }
-
-  const final = distFromCenter(pos[0], pos[1]);
-  const expectedScore = final * 10;
+  const expectedScore = finalDist * 10;
   log.ok(
-    `[maze] R${roundNum} END: pos=(${pos.join(',')}) dist=${final} hp=${hp.toFixed(1)} ` +
+    `[maze] R${roundNum} END: pos=(${pos.join(',')}) dist=${finalDist} hp=${hp.toFixed(1)} steps=${stepCount} ` +
       `expected_score=${expectedScore}+ (+1..50 tile)`,
   );
+
+  // ==== NO PHASE 2 - kalau dist 12+, ring edge biasanya sepi ====
+  // Phase 2 dodge cuma BUANG HP. Lebih baik stay where we are.
 }
